@@ -1,0 +1,522 @@
+# SentinelAI Frontend Build Specification
+
+## Tech Stack
+
+- **Framework**: React with TypeScript
+- **Styling**: Tailwind CSS
+- **Charts**: Recharts
+- **State Management**: React Query + Context API
+- **Deployment**: Vercel
+
+## Project Structure
+
+```
+frontend/
+├── src/
+│   ├── components/
+│   │   ├── Dashboard/
+│   │   ├── ProtocolHealth/
+│   │   ├── Settings/
+│   │   └── common/
+│   ├── contexts/
+│   ├── hooks/
+│   ├── services/
+│   ├── types/
+│   └── utils/
+├── public/
+└── package.json
+```
+
+## Pages to Build
+
+### 1. Dashboard Page (`/dashboard`)
+
+**Purpose**: Main view showing all protected positions and system activity
+
+**Components to Build**:
+
+#### PortfolioOverview Component
+
+```typescript
+interface PortfolioOverviewProps {
+  totalValue: number;
+  protectionStatus: 'active' | 'warning' | 'critical';
+  positions: Position[];
+}
+
+// Display:
+// - Total portfolio value (large, prominent)
+// - Protection status badge (green/yellow/red)
+// - Recent actions count
+// - Historical performance graph (last 30 days)
+```
+
+#### PositionCard Component
+
+```typescript
+interface Position {
+  id: string;
+  protocolName: string;
+  protocolAddress: string;
+  amount: number;
+  lastHealthScore: number;
+  trend: '↑' | '↓' | '→';
+  lastUpdated: Date;
+}
+
+// Visual Requirements:
+// - Color-coded by health score:
+//   * 80-100: Green (#10B981)
+//   * 60-79: Yellow (#F59E0B)
+//   * 40-59: Orange (#F97316)
+//   * 0-39: Red (#EF4444)
+// - Display protocol logo/icon
+// - Show amount in USDC
+// - Health score with trend arrow
+// - Last updated timestamp
+// - Click to expand for details
+```
+
+#### RecentActionsTimeline Component
+
+```typescript
+interface RebalancingAction {
+  id: string;
+  timestamp: Date;
+  fromProtocol: string;
+  toProtocols: string[];
+  amountExited: number;
+  reason: string;
+  txHash: string;
+}
+
+// Display:
+// - Chronological list (most recent first)
+// - Each action shows:
+//   * Time (relative: "2 hours ago")
+//   * Action type icon
+//   * From/To protocols
+//   * Amount moved
+//   * Reason (truncated with expand)
+//   * Link to Arc blockchain explorer with tx hash
+```
+
+#### HistoricalPerformanceChart Component
+
+```typescript
+// Using Recharts
+// - Line chart showing portfolio value over time
+// - Mark rebalancing events on timeline
+// - Tooltip showing:
+//   * Date
+//   * Portfolio value
+//   * Any actions taken that day
+// - Responsive (mobile: simplified view)
+```
+
+### 2. Protocol Health Page (`/protocols`)
+
+**Purpose**: Grid view of all monitored protocols with health metrics
+
+**Components to Build**:
+
+#### ProtocolGrid Component
+
+```typescript
+interface Protocol {
+  address: string;
+  name: string;
+  healthScore: number;
+  confidence: number;
+  trend: '↑' | '↓' | '→';
+  riskFactors: string[];
+  tvl: number;
+  lastUpdated: Date;
+}
+
+// Layout:
+// - Grid of protocol cards (3-4 per row on desktop)
+// - Sort options: Health Score, TVL, Name
+// - Filter options: Score ranges, Has positions
+```
+
+#### ProtocolDetailCard Component
+
+```typescript
+// Visual Requirements:
+// - Large health score (circular progress indicator)
+// - Confidence percentage
+// - Trend indicator (arrow with color)
+// - Top 3 risk factors (expandable)
+// - TVL display
+// - "View Details" button
+```
+
+#### ProtocolHealthChart Component
+
+```typescript
+// Historical health score chart (last 14 days)
+// - Line chart with Recharts
+// - Color gradient based on score ranges
+// - Mark significant events (exits, failures)
+// - Show confidence bounds as shaded area
+```
+
+#### RiskFactorsPanel Component
+
+```typescript
+interface RiskFactor {
+  severity: 'high' | 'medium' | 'low';
+  description: string;
+  detectedAt: Date;
+}
+
+// Display:
+// - List of current risk factors
+// - Severity indicator (icon + color)
+// - Brief description
+// - Detection timestamp
+// - "Learn more" tooltip
+```
+
+### 3. Settings Page (`/settings`)
+
+**Purpose**: User configuration and preferences
+
+**Components to Build**:
+
+#### RiskToleranceSelector Component
+
+```typescript
+type RiskTolerance = 'conservative' | 'moderate' | 'aggressive';
+
+interface RiskToleranceConfig {
+  tolerance: RiskTolerance;
+  exitThresholds: {
+    critical: number;  // Score below which to exit 100%
+    high: number;      // Score below which to exit 50-70%
+    medium: number;    // Score below which to exit 20-30%
+  };
+}
+
+// UI:
+// - Radio buttons or cards for each tolerance level
+// - Show corresponding thresholds for each level:
+//   * Conservative: 60/40/20 exit at scores
+//   * Moderate: 40/25/15
+//   * Aggressive: 25/15/10
+// - Visual explanation of what each means
+```
+
+#### ExitThresholdsCustomizer Component
+
+```typescript
+// Allow manual threshold adjustment
+// - Three sliders for critical/high/medium
+// - Real-time preview of what would trigger exits
+// - Warning if thresholds are very aggressive
+// - "Reset to default" button
+```
+
+#### ProtocolWhitelistManager Component
+
+```typescript
+interface ProtocolFilter {
+  whitelistedProtocols: string[];
+  blacklistedProtocols: string[];
+}
+
+// UI:
+// - Search and add protocols to whitelist
+// - Search and add protocols to blacklist
+// - Display current filters as removable chips
+// - Warning: "Blacklisting may limit rebalancing options"
+```
+
+#### NotificationPreferences Component
+
+```typescript
+interface NotificationSettings {
+  email: boolean;
+  push: boolean;
+  sms: boolean;
+  alertThresholds: {
+    scoreDrops: number;  // Alert when score drops by X points
+    rebalancing: boolean;
+    criticalActions: boolean;
+  };
+}
+
+// UI:
+// - Toggle switches for each channel
+// - Slider for score drop threshold
+// - Checkboxes for event types
+```
+
+## Shared Components
+
+### Header Component
+
+```typescript
+// Display:
+// - SentinelAI logo
+// - Navigation menu (Dashboard, Protocols, Settings)
+// - User wallet address (truncated)
+// - Connection status indicator
+// - Mobile: Hamburger menu
+```
+
+### HealthScoreBadge Component
+
+```typescript
+interface HealthScoreBadgeProps {
+  score: number;
+  size: 'small' | 'medium' | 'large';
+  showLabel?: boolean;
+}
+
+// Reusable component for displaying health scores
+// - Color-coded background
+// - Optional label ("Healthy", "Warning", "Critical")
+// - Consistent across all pages
+```
+
+### LoadingState Component
+
+```typescript
+// Skeleton screens for:
+// - Dashboard loading
+// - Protocol cards loading
+// - Charts loading
+// Use Tailwind's animation-pulse
+```
+
+### EmptyState Component
+
+```typescript
+interface EmptyStateProps {
+  icon: ReactNode;
+  title: string;
+  description: string;
+  action?: {
+    label: string;
+    onClick: () => void;
+  };
+}
+
+// Use for:
+// - No positions yet
+// - No protocols monitored
+// - No actions taken
+```
+
+## Real-Time Updates
+
+### Implementation using React Query
+
+```typescript
+// Poll backend every 30 seconds
+const { data: positions } = useQuery(
+  'positions',
+  fetchPositions,
+  {
+    refetchInterval: 30000,
+    refetchOnWindowFocus: true,
+  }
+);
+
+// For critical updates, consider WebSocket:
+const useRealtimeAlerts = () => {
+  useEffect(() => {
+    const ws = new WebSocket('wss://api.sentinelai.com/alerts');
+    ws.onmessage = (event) => {
+      // Show toast notification
+      // Update relevant queries
+    };
+    return () => ws.close();
+  }, []);
+};
+```
+
+## Responsive Design Requirements
+
+### Breakpoints (Tailwind)
+
+- `sm`: 640px (mobile landscape)
+- `md`: 768px (tablet)
+- `lg`: 1024px (desktop)
+- `xl`: 1280px (large desktop)
+
+### Mobile Considerations
+
+- Dashboard: Stack cards vertically
+- Protocol grid: 1 column on mobile, 2 on tablet, 3+ on desktop
+- Charts: Simplified on mobile (fewer data points)
+- Navigation: Hamburger menu on mobile
+- Tables: Horizontal scroll or card view on mobile
+
+## Color Palette
+
+```typescript
+// Health Score Colors
+const healthColors = {
+  excellent: '#10B981',  // 80-100
+  good: '#F59E0B',       // 60-79
+  warning: '#F97316',    // 40-59
+  critical: '#EF4444',   // 0-39
+};
+
+// UI Colors
+const colors = {
+  background: '#0F172A',     // Dark blue-gray
+  surface: '#1E293B',        // Lighter surface
+  primary: '#3B82F6',        // Blue
+  text: '#F1F5F9',          // Light text
+  textSecondary: '#94A3B8', // Gray text
+};
+```
+
+## Error Handling
+
+### Error Boundary Component
+
+```typescript
+// Wrap entire app
+// Show friendly error message
+// Log errors to monitoring service
+// Provide "Reload" button
+```
+
+### API Error States
+
+```typescript
+// Show inline errors for:
+// - Failed to load positions
+// - Failed to update settings
+// - Transaction failures
+// Use toast notifications for transient errors
+// Use error banners for persistent issues
+```
+
+## Accessibility Requirements
+
+- All interactive elements keyboard accessible
+- Proper ARIA labels
+- Color contrast ratio ≥ 4.5:1
+- Screen reader friendly
+- Focus indicators visible
+- Semantic HTML
+
+## Performance Targets
+
+- First Contentful Paint: < 1.5s
+- Time to Interactive: < 3.5s
+- Lighthouse Score: > 90
+- Bundle size: < 500KB (gzipped)
+
+## Demo Mode
+
+### DemoModeProvider Component
+
+```typescript
+interface DemoState {
+  isDemo: boolean;
+  currentDay: number;  // Simulated day (0-7)
+  speed: 'normal' | 'fast';
+  scenarioData: DemoScenario;
+}
+
+// Controls:
+// - Play/Pause simulation
+// - Speed control (1x, 5x, 10x)
+// - Reset to day 0
+// - Show/hide narration overlay
+```
+
+### NarrationOverlay Component
+
+```typescript
+// Display demo script text
+// - Timed to match simulation events
+// - Dismissible
+// - Positioned bottom of screen
+// - Semi-transparent background
+```
+
+## Installation & Setup
+
+```bash
+# Create React app with TypeScript
+npx create-react-app sentinelai-frontend --template typescript
+
+# Install dependencies
+npm install react-query axios recharts tailwindcss
+npm install @headlessui/react @heroicons/react
+npm install date-fns class-variance-authority clsx
+
+# Initialize Tailwind
+npx tailwindcss init -p
+```
+
+## Environment Variables
+
+```env
+REACT_APP_API_URL=http://localhost:3001
+REACT_APP_WS_URL=ws://localhost:3001
+REACT_APP_CIRCLE_API_KEY=your_key
+REACT_APP_ARC_EXPLORER_URL=https://explorer.arc.network
+```
+
+## Day 5 Implementation Checklist
+
+### Morning (Dashboard)
+
+- [ ] Create project structure
+- [ ] Set up Tailwind config
+- [ ] Build PortfolioOverview component
+- [ ] Build PositionCard component (with color coding)
+- [ ] Build RecentActionsTimeline component
+- [ ] Build HistoricalPerformanceChart
+- [ ] Integrate with mock API data
+- [ ] Test responsive layout
+
+### Afternoon (Settings & Polish)
+
+- [ ] Build Settings page components
+- [ ] Build RiskToleranceSelector
+- [ ] Build NotificationPreferences
+- [ ] Add real-time polling with React Query
+- [ ] Test all API connections
+- [ ] Mobile responsive testing
+- [ ] Add loading states
+- [ ] Add error boundaries
+
+## Testing Strategy
+
+```typescript
+// Component tests with React Testing Library
+test('PositionCard displays correct health color', () => {
+  render(<PositionCard position={mockPosition} />);
+  const card = screen.getByTestId('position-card');
+  expect(card).toHaveClass('bg-green-500'); // For score > 80
+});
+
+// Integration tests
+test('Dashboard loads and displays positions', async () => {
+  render(<Dashboard />);
+  await waitFor(() => {
+    expect(screen.getByText('Total Value')).toBeInTheDocument();
+  });
+});
+```
+
+## Deployment Checklist
+
+- [ ] Build optimized production bundle
+- [ ] Configure environment variables in Vercel
+- [ ] Set up custom domain (optional)
+- [ ] Enable automatic deployments from main branch
+- [ ] Test production build locally
+- [ ] Deploy to Vercel
+- [ ] Verify all API connections work in production
+- [ ] Test on multiple devices/browsers
