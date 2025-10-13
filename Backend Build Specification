@@ -1,0 +1,1344 @@
+# SentinelAI Backend Build Specification
+
+## Tech Stack
+
+- **Language**: TypeScript (Node.js 18+)
+- **Framework**: Express.js
+- **Database**: PostgreSQL 14+
+- **Queue**: Redis + Bull
+- **Deployment**: Railway or Render
+- **Blockchain**: Arc testnet → mainnet
+
+## Project Structure
+
+```
+backend/
+├── src/
+│   ├── controllers/
+│   ├── services/
+│   │   ├── monitoring/
+│   │   ├── wallet/
+│   │   ├── ml/
+│   │   └── automation/
+│   ├── models/
+│   ├── routes/
+│   ├── middleware/
+│   ├── config/
+│   ├── types/
+│   └── utils/
+├── contracts/
+│   ├── PositionManager.sol
+│   ├── RiskRegistry.sol
+│   └── test/
+├── migrations/
+└── package.json
+```
+
+## Database Schema Implementation
+
+### Create migrations (Day 1 Afternoon)
+
+```sql
+-- Migration 001: Create users table
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  circle_wallet_id TEXT UNIQUE NOT NULL,
+  wallet_address TEXT UNIQUE NOT NULL,
+  risk_tolerance TEXT NOT NULL DEFAULT 'moderate',
+  exit_thresholds JSONB NOT NULL DEFAULT '{
+    "critical": 20,
+    "high": 40,
+    "medium": 60
+  }',
+  notification_settings JSONB NOT NULL DEFAULT '{
+    "email": true,
+    "push": false,
+    "sms": false
+  }',
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_wallet_id ON users(circle_wallet_id);
+CREATE INDEX idx_users_wallet_address ON users(wallet_address);
+
+-- Migration 002: Create positions table
+CREATE TABLE positions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  protocol_address TEXT NOT NULL,
+  protocol_name TEXT NOT NULL,
+  amount NUMERIC(20, 6) NOT NULL,
+  last_health_score INTEGER NOT NULL,
+  last_health_trend TEXT NOT NULL DEFAULT '→',
+  last_confidence INTEGER NOT NULL DEFAULT 0,
+  last_updated TIMESTAMP NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  CONSTRAINT positive_amount CHECK (amount >= 0),
+  CONSTRAINT valid_health_score CHECK (last_health_score BETWEEN 0 AND 100)
+);
+
+CREATE INDEX idx_positions_user_id ON positions(user_id);
+CREATE INDEX idx_positions_protocol ON positions(protocol_address);
+CREATE INDEX idx_positions_health ON positions(last_health_score);
+
+-- Migration 003: Create protocol_health table
+CREATE TABLE protocol_health (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  protocol_address TEXT NOT NULL,
+  protocol_name TEXT NOT NULL,
+  health_score INTEGER NOT NULL,
+  confidence INTEGER NOT NULL,
+  trend TEXT NOT NULL,
+  risk_factors JSONB NOT NULL DEFAULT '[]',
+  signals JSONB NOT NULL,
+  tvl NUMERIC(20, 2),
+  timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
+  CONSTRAINT valid_health_score CHECK (health_score BETWEEN 0 AND 100),
+  CONSTRAINT valid_confidence CHECK (confidence BETWEEN 0 AND 100)
+);
+
+CREATE INDEX idx_protocol_health_address ON protocol_health(protocol_address);
+CREATE INDEX idx_protocol_health_timestamp ON protocol_health(timestamp DESC);
+CREATE INDEX idx_protocol_health_score ON protocol_health(health_score);
+
+-- Migration 004: Create rebalancing_history table
+CREATE TABLE rebalancing_history (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  from_protocol TEXT NOT NULL,
+  from_protocol_name TEXT NOT NULL,
+  to_protocols JSONB NOT NULL,
+  amount_exited NUMERIC(20, 6) NOT NULL,
+  exit_percentage INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  health_score_at_exit INTEGER NOT NULL,
+  tx_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  executed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMP,
+  CONSTRAINT valid_exit_percentage CHECK (exit_percentage BETWEEN 0 AND 100)
+);
+
+CREATE INDEX idx_rebalancing_user ON rebalancing_history(user_id);
+CREATE INDEX idx_rebalancing_timestamp ON rebalancing_history(executed_at DESC);
+CREATE INDEX idx_rebalancing_status ON rebalancing_history(status);
+
+-- Migration 005: Create monitoring_logs table (for debugging)
+CREATE TABLE monitoring_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  log_type TEXT NOT NULL,
+  protocol_address TEXT,
+  user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  message TEXT NOT NULL,
+  metadata JSONB,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_logs_type ON monitoring_logs(log_type);
+CREATE INDEX idx_logs_timestamp ON monitoring_logs(created_at DESC);
+```
+
+## Smart Contracts (Day 1 Afternoon)
+
+### PositionManager.sol
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract PositionManager is ReentrancyGuard, Ownable {
+    IERC20 public immutable USDC;
+    address public riskRegistry;
+    
+    struct Position {
+        address user;
+        address protocol;
+        uint256 amount;
+        uint256 lastHealthScore;
+        uint256 lastUpdated;
+    }
+    
+    // user => protocol => Position
+    mapping(address => mapping(address => Position)) public positions;
+    
+    event PositionCreated(address indexed user, address indexed protocol, uint256 amount);
+    event GradualExitExecuted(address indexed user, address indexed protocol, uint256 amount, uint8 exitPercentage);
+    event RedistributedToSafe(address indexed user, uint256 amount, address[] protocols);
+    
+    constructor(address _usdc) {
+        USDC = IERC20(_usdc);
+    }
+    
+    function setRiskRegistry(address _registry) external onlyOwner {
+        riskRegistry = _registry;
+    }
+    
+    /**
+     * @notice Create or update a position
+     * @param protocol The DeFi protocol address
+     * @param amount The amount in USDC (6 decimals)
+     */
+    function createPosition(address protocol, uint256 amount) external nonReentrant {
+        require(amount > 0, "Amount must be positive");
+        require(USDC.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        
+        Position storage pos = positions[msg.sender][protocol];
+        pos.user = msg.sender;
+        pos.protocol = protocol;
+        pos.amount += amount;
+        pos.lastUpdated = block.timestamp;
+        
+        emit PositionCreated(msg.sender, protocol, amount);
+    }
+    
+    /**
+     * @notice Execute gradual exit based on health score
+     * @param user The user address
+     * @param protocol The protocol to exit from
+     * @param exitPercentage Percentage to exit (0-100)
+     */
+    function executeGradualExit(
+        address user,
+        address protocol,
+        uint8 exitPercentage
+    ) external nonReentrant returns (uint256 exitAmount) {
+        require(msg.sender == owner() || msg.sender == riskRegistry, "Unauthorized");
+        require(exitPercentage > 0 && exitPercentage <= 100, "Invalid percentage");
+        
+        Position storage pos = positions[user][protocol];
+        require(pos.amount > 0, "No position");
+        
+        exitAmount = (pos.amount * exitPercentage) / 100;
+        pos.amount -= exitAmount;
+        pos.lastUpdated = block.timestamp;
+        
+        require(USDC.transfer(user, exitAmount), "Transfer failed");
+        
+        emit GradualExitExecuted(user, protocol, exitAmount, exitPercentage);
+        return exitAmount;
+    }
+    
+    /**
+     * @notice Get safe protocols from risk registry and redistribute funds
+     * @param user The user address
+     * @param amount Total amount to redistribute
+     */
+    function redistributeToSafeProtocols(
+        address user,
+        uint256 amount
+    ) external nonReentrant {
+        require(msg.sender == owner() || msg.sender == riskRegistry, "Unauthorized");
+        
+        // Get safe protocols from risk registry
+        address[] memory safeProtocols = _getSafeProtocols();
+        require(safeProtocols.length > 0, "No safe protocols");
+        
+        // Distribute equally
+        uint256 amountPerProtocol = amount / safeProtocols.length;
+        
+        for (uint256 i = 0; i < safeProtocols.length; i++) {
+            Position storage pos = positions[user][safeProtocols[i]];
+            pos.user = user;
+            pos.protocol = safeProtocols[i];
+            pos.amount += amountPerProtocol;
+            pos.lastUpdated = block.timestamp;
+        }
+        
+        emit RedistributedToSafe(user, amount, safeProtocols);
+    }
+    
+    /**
+     * @notice Get position details
+     */
+    function getPosition(address user, address protocol) 
+        external 
+        view 
+        returns (uint256 amount, uint256 lastHealthScore, uint256 lastUpdated) 
+    {
+        Position memory pos = positions[user][protocol];
+        return (pos.amount, pos.lastHealthScore, pos.lastUpdated);
+    }
+    
+    function _getSafeProtocols() private view returns (address[] memory) {
+        // Call RiskRegistry to get protocols with health > 80
+        // For now, return mock data
+        address[] memory safe = new address[](3);
+        // This would be populated from risk registry
+        return safe;
+    }
+}
+```
+
+### RiskRegistry.sol
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract RiskRegistry is Ownable {
+    struct ProtocolHealth {
+        uint8 healthScore;      // 0-100
+        uint8 confidence;       // 0-100
+        string trend;           // "↑", "↓", "→"
+        uint256 lastUpdated;
+        bool isActive;
+    }
+    
+    mapping(address => ProtocolHealth) public protocolHealth;
+    address[] public monitoredProtocols;
+    
+    event HealthScoreUpdated(
+        address indexed protocol,
+        uint8 healthScore,
+        uint8 confidence,
+        string trend
+    );
+    
+    /**
+     * @notice Update protocol health score (called by oracle/backend)
+     * @param protocol The protocol address
+     * @param score Health score 0-100
+     * @param confidence Confidence level 0-100
+     * @param trend Trend indicator
+     */
+    function updateHealthScore(
+        address protocol,
+        uint8 score,
+        uint8 confidence,
+        string calldata trend
+    ) external onlyOwner {
+        require(score <= 100, "Invalid score");
+        require(confidence <= 100, "Invalid confidence");
+        
+        ProtocolHealth storage health = protocolHealth[protocol];
+        
+        if (!health.isActive) {
+            monitoredProtocols.push(protocol);
+            health.isActive = true;
+        }
+        
+        health.healthScore = score;
+        health.confidence = confidence;
+        health.trend = trend;
+        health.lastUpdated = block.timestamp;
+        
+        emit HealthScoreUpdated(protocol, score, confidence, trend);
+    }
+    
+    /**
+     * @notice Get protocol health
+     */
+    function getProtocolHealth(address protocol)
+        external
+        view
+        returns (
+            uint8 healthScore,
+            uint8 confidence,
+            string memory trend,
+            uint256 lastUpdated
+        )
+    {
+        ProtocolHealth memory health = protocolHealth[protocol];
+        return (
+            health.healthScore,
+            health.confidence,
+            health.trend,
+            health.lastUpdated
+        );
+    }
+    
+    /**
+     * @notice Get all safe protocols (health > 80)
+     */
+    function getSafeProtocols() external view returns (address[] memory) {
+        uint256 count = 0;
+        
+        // First pass: count safe protocols
+        for (uint256 i = 0; i < monitoredProtocols.length; i++) {
+            if (protocolHealth[monitoredProtocols[i]].healthScore >= 80) {
+                count++;
+            }
+        }
+        
+        // Second pass: populate array
+        address[] memory safe = new address[](count);
+        uint256 index = 0;
+        
+        for (uint256 i = 0; i < monitoredProtocols.length; i++) {
+            address protocol = monitoredProtocols[i];
+            if (protocolHealth[protocol].healthScore >= 80) {
+                safe[index] = protocol;
+                index++;
+            }
+        }
+        
+        return safe;
+    }
+    
+    /**
+     * @notice Get all monitored protocols
+     */
+    function getAllProtocols() external view returns (address[] memory) {
+        return monitoredProtocols;
+    }
+}
+```
+
+### Hardhat Test Suite
+
+```typescript
+// test/PositionManager.test.ts
+import { expect } from "chai";
+import { ethers } from "hardhat";
+
+describe("PositionManager", function () {
+  let positionManager, usdc, owner, user;
+  
+  beforeEach(async function () {
+    [owner, user] = await ethers.getSigners();
+    
+    // Deploy mock USDC
+    const USDC = await ethers.getContractFactory("MockUSDC");
+    usdc = await USDC.deploy();
+    
+    // Deploy PositionManager
+    const PositionManager = await ethers.getContractFactory("PositionManager");
+    positionManager = await PositionManager.deploy(usdc.address);
+    
+    // Mint USDC to user
+    await usdc.mint(user.address, ethers.utils.parseUnits("10000", 6));
+    await usdc.connect(user).approve(positionManager.address, ethers.constants.MaxUint256);
+  });
+  
+  it("Should create position", async function () {
+    const protocol = "0x" + "1".repeat(40);
+    const amount = ethers.utils.parseUnits("1000", 6);
+    
+    await expect(
+      positionManager.connect(user).createPosition(protocol, amount)
+    ).to.emit(positionManager, "PositionCreated");
+    
+    const position = await positionManager.getPosition(user.address, protocol);
+    expect(position.amount).to.equal(amount);
+  });
+  
+  it("Should execute gradual exit", async function () {
+    const protocol = "0x" + "1".repeat(40);
+    const amount = ethers.utils.parseUnits("1000", 6);
+    
+    await positionManager.connect(user).createPosition(protocol, amount);
+    
+    // Exit 30%
+    await positionManager.executeGradualExit(user.address, protocol, 30);
+    
+    const position = await positionManager.getPosition(user.address, protocol);
+    expect(position.amount).to.equal(ethers.utils.parseUnits("700", 6));
+  });
+  
+  // Add more tests...
+});
+```
+
+## Service Layer Implementation
+
+### 1. Protocol Monitor Service (Day 2)
+
+```typescript
+// src/services/monitoring/ProtocolMonitor.ts
+
+import axios from 'axios';
+import { ethers } from 'ethers';
+
+interface OnChainSignals {
+  tvl: number;
+  tvlChange24h: number;
+  whaleExits: number;
+  liquidationLevels: number;
+  gasAnomalies: boolean;
+}
+
+interface PriceSignals {
+  price: number;
+  priceChange24h: number;
+  liquidityDepth: number;
+  dexCexSpread: number;
+}
+
+interface SocialSignals {
+  twitterSentiment: number;
+  discordActivity: number;
+  redditMentions: number;
+}
+
+export class ProtocolMonitor {
+  private provider: ethers.providers.Provider;
+  
+  constructor(rpcUrl: string) {
+    this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+  }
+  
+  /**
+   * Collect on-chain signals
+   */
+  async collectOnChainSignals(protocolAddress: string): Promise<OnChainSignals> {
+    try {
+      // Query protocol contract for TVL
+      const protocolContract = new ethers.Contract(
+        protocolAddress,
+        ['function totalValueLocked() view returns (uint256)'],
+        this.provider
+      );
+      
+      const currentTVL = await protocolContract.totalValueLocked();
+      
+      // Get TVL from 24h ago (from database or archive node)
+      const tvl24hAgo = await this.getTVLFromHistory(protocolAddress, Date.now() - 86400000);
+      const tvlChange = ((Number(currentTVL) - tvl24hAgo) / tvl24hAgo) * 100;
+      
+      // Detect whale exits (wallets moving >5% of TVL)
+      const whaleExits = await this.detectWhaleMovements(protocolAddress);
+      
+      // Check liquidation levels
+      const liquidationLevels = await this.checkLiquidationRisk(protocolAddress);
+      
+      // Monitor gas anomalies
+      const gasAnomalies = await this.detectGasAnomalies();
+      
+      return {
+        tvl: Number(currentTVL),
+        tvlChange24h: tvlChange,
+        whaleExits,
+        liquidationLevels,
+        gasAnomalies,
+      };
+    } catch (error) {
+      console.error('Failed to collect on-chain signals:', error);
+      return {
+        tvl: 0,
+        tvlChange24h: 0,
+        whaleExits: 0,
+        liquidationLevels: 0,
+        gasAnomalies: false,
+      };
+    }
+  }
+  
+  private async getTVLFromHistory(protocol: string, timestamp: number): Promise<number> {
+    const result = await db.query(`
+      SELECT tvl FROM protocol_health
+      WHERE protocol_address = $1 
+      AND timestamp <= to_timestamp($2 / 1000)
+      ORDER BY timestamp DESC
+      LIMIT 1
+    `, [protocol, timestamp]);
+    
+    return result.rows[0]?.tvl || 0;
+  }
+  
+  private async detectWhaleMovements(protocol: string): Promise<number> {
+    // Query recent large transfers from protocol
+    const filter = {
+      address: protocol,
+      topics: [ethers.utils.id('Transfer(address,address,uint256)')],
+      fromBlock: -1000, // Last ~1000 blocks
+    };
+    
+    const logs = await this.provider.getLogs(filter);
+    
+    // Count transfers > $500K
+    let whaleCount = 0;
+    for (const log of logs) {
+      const amount = ethers.BigNumber.from(log.data);
+      if (amount.gt(ethers.utils.parseUnits('500000', 6))) {
+        whaleCount++;
+      }
+    }
+    
+    return whaleCount;
+  }
+  
+  private async checkLiquidationRisk(protocol: string): Promise<number> {
+    // Query protocol's liquidation threshold
+    // Return percentage of positions near liquidation
+    try {
+      const contract = new ethers.Contract(
+        protocol,
+        ['function getHealthFactor() view returns (uint256)'],
+        this.provider
+      );
+      
+      const healthFactor = await contract.getHealthFactor();
+      
+      // Convert to risk score (lower health factor = higher risk)
+      return Math.max(0, 100 - Number(healthFactor));
+    } catch {
+      return 0;
+    }
+  }
+  
+  private async detectGasAnomalies(): Promise<boolean> {
+    const currentGasPrice = await this.provider.getGasPrice();
+    const avgGasPrice = ethers.utils.parseUnits('50', 'gwei'); // Baseline
+    
+    // Anomaly if gas is 3x normal
+    return currentGasPrice.gt(avgGasPrice.mul(3));
+  }
+  
+  /**
+   * Collect price signals
+   */
+  async collectPriceSignals(tokenAddress: string): Promise<PriceSignals> {
+    try {
+      // Fetch from DEX API (Uniswap, etc.)
+      const dexPrice = await this.getDEXPrice(tokenAddress);
+      
+      // Fetch from CEX API (if available)
+      const cexPrice = await this.getCEXPrice(tokenAddress);
+      
+      // Calculate spread
+      const spread = Math.abs((dexPrice - cexPrice) / cexPrice) * 100;
+      
+      // Get 24h price change
+      const price24hAgo = await this.getPriceFromHistory(tokenAddress, Date.now() - 86400000);
+      const priceChange = ((dexPrice - price24hAgo) / price24hAgo) * 100;
+      
+      // Get liquidity depth
+      const liquidityDepth = await this.getLiquidityDepth(tokenAddress);
+      
+      return {
+        price: dexPrice,
+        priceChange24h: priceChange,
+        liquidityDepth,
+        dexCexSpread: spread,
+      };
+    } catch (error) {
+      console.error('Failed to collect price signals:', error);
+      return {
+        price: 0,
+        priceChange24h: 0,
+        liquidityDepth: 0,
+        dexCexSpread: 0,
+      };
+    }
+  }
+  
+  private async getDEXPrice(token: string): Promise<number> {
+    // Mock implementation - integrate with actual DEX API
+    return 1.0;
+  }
+  
+  private async getCEXPrice(token: string): Promise<number> {
+    // Mock implementation - integrate with CEX API
+    return 1.0;
+  }
+  
+  private async getPriceFromHistory(token: string, timestamp: number): Promise<number> {
+    // Query from database
+    return 1.0;
+  }
+  
+  private async getLiquidityDepth(token: string): Promise<number> {
+    // Query liquidity pool reserves
+    return 1000000;
+  }
+  
+  /**
+   * Collect social signals
+   */
+  async collectSocialSignals(protocolName: string): Promise<SocialSignals> {
+    try {
+      // Twitter sentiment (requires Twitter API)
+      const twitterSentiment = await this.getTwitterSentiment(protocolName);
+      
+      // Discord activity
+      const discordActivity = await this.getDiscordActivity(protocolName);
+      
+      // Reddit mentions
+      const redditMentions = await this.getRedditMentions(protocolName);
+      
+      return {
+        twitterSentiment,
+        discordActivity,
+        redditMentions,
+      };
+    } catch (error) {
+      console.error('Failed to collect social signals:', error);
+      return {
+        twitterSentiment: 0,
+        discordActivity: 0,
+        redditMentions: 0,
+      };
+    }
+  }
+  
+  private async getTwitterSentiment(protocol: string): Promise<number> {
+    // Use Twitter API to search recent tweets
+    // Analyze sentiment with NLP
+    // Return score -100 to 100
+    return 0;
+  }
+  
+  private async getDiscordActivity(protocol: string): Promise<number> {
+    // Monitor Discord server activity
+    // Return normalized activity score 0-100
+    return 50;
+  }
+  
+  private async getRedditMentions(protocol: string): Promise<number> {
+    // Search Reddit for protocol mentions
+    // Return count
+    return 0;
+  }
+}
+
+export const protocolMonitor = new ProtocolMonitor(
+  process.env.ARC_RPC_URL || 'https://rpc.arc.network'
+);
+```
+
+-----
+
+### 2. Predictive ML Service (Day 3)
+
+```python
+# ml-service/predictor.py
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import pickle
+
+class HealthPredictor:
+    def __init__(self):
+        self.gb_model = None
+        self.lstm_model = None
+        self.feature_columns = [
+            'tvl', 'tvl_change_24h', 'whale_exits', 'liquidation_levels',
+            'price', 'price_change_24h', 'liquidity_depth', 'dex_cex_spread',
+            'twitter_sentiment', 'discord_activity', 'reddit_mentions'
+        ]
+        
+        # Load trained models if available
+        try:
+            with open('models/gb_model.pkl', 'rb') as f:
+                self.gb_model = pickle.load(f)
+            self.lstm_model = tf.keras.models.load_model('models/lstm_model.h5')
+            print("Models loaded successfully")
+        except:
+            print("No pre-trained models found. Training required.")
+    
+    def train(self, training_data: pd.DataFrame):
+        """
+        Train the ensemble model
+        training_data should have columns: features + 'health_score' + 'days_to_failure'
+        """
+        X = training_data[self.feature_columns].values
+        y_score = training_data['health_score'].values
+        y_failure = (training_data['days_to_failure'] <= 14).astype(int)
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_failure, test_size=0.2, random_state=42
+        )
+        
+        # Train Gradient Boosting
+        print("Training Gradient Boosting model...")
+        self.gb_model = GradientBoostingClassifier(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=5,
+            random_state=42
+        )
+        self.gb_model.fit(X_train, y_train)
+        
+        gb_accuracy = self.gb_model.score(X_test, y_test)
+        print(f"GB Model Accuracy: {gb_accuracy:.2%}")
+        
+        # Train LSTM
+        print("Training LSTM model...")
+        self.lstm_model = self._build_lstm_model(X_train.shape[1])
+        
+        # Reshape for LSTM (samples, timesteps, features)
+        X_train_lstm = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
+        X_test_lstm = X_test.reshape((X_test.shape[0], 1, X_test.shape[1]))
+        
+        self.lstm_model.fit(
+            X_train_lstm, y_train,
+            epochs=50,
+            batch_size=32,
+            validation_split=0.2,
+            verbose=0
+        )
+        
+        lstm_accuracy = self.lstm_model.evaluate(X_test_lstm, y_test, verbose=0)[1]
+        print(f"LSTM Model Accuracy: {lstm_accuracy:.2%}")
+        
+        # Save models
+        with open('models/gb_model.pkl', 'wb') as f:
+            pickle.dump(self.gb_model, f)
+        self.lstm_model.save('models/lstm_model.h5')
+        
+        print("Models saved successfully")
+    
+    def _build_lstm_model(self, input_dim):
+        model = Sequential([
+            LSTM(64, input_shape=(1, input_dim), return_sequences=True),
+            Dropout(0.2),
+            LSTM(32),
+            Dropout(0.2),
+            Dense(16, activation='relu'),
+            Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(
+            optimizer='adam',
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    def predict(self, signals: dict) -> dict:
+        """
+        Predict health score and risk factors
+        """
+        # Extract features
+        features = np.array([[
+            signals.get('tvl', 0),
+            signals.get('tvl_change_24h', 0),
+            signals.get('whale_exits', 0),
+            signals.get('liquidation_levels', 0),
+            signals.get('price', 1.0),
+            signals.get('price_change_24h', 0),
+            signals.get('liquidity_depth', 0),
+            signals.get('dex_cex_spread', 0),
+            signals.get('twitter_sentiment', 0),
+            signals.get('discord_activity', 50),
+            signals.get('reddit_mentions', 0)
+        ]])
+        
+        if self.gb_model is None or self.lstm_model is None:
+            # Return default prediction if models not loaded
+            return {
+                'health_score': 50,
+                'confidence': 0,
+                'trend': '→',
+                'risk_factors': ['Models not trained'],
+            }
+        
+        # Get predictions
+        gb_pred = self.gb_model.predict_proba(features)[0][1]
+        
+        features_lstm = features.reshape((features.shape[0], 1, features.shape[1]))
+        lstm_pred = self.lstm_model.predict(features_lstm, verbose=0)[0][0]
+        
+        # Ensemble (60% GB, 40% LSTM)
+        failure_probability = 0.6 * gb_pred + 0.4 * lstm_pred
+        health_score = int((1 - failure_probability) * 100)
+        
+        # Calculate confidence based on agreement
+        agreement = 1 - abs(gb_pred - lstm_pred)
+        confidence = int(agreement * 100)
+        
+        # Determine trend
+        trend = self._calculate_trend(signals)
+        
+        # Identify risk factors
+        risk_factors = self._identify_risk_factors(signals, health_score)
+        
+        return {
+            'health_score': health_score,
+            'confidence': confidence,
+            'trend': trend,
+            'risk_factors': risk_factors,
+        }
+    
+    def _calculate_trend(self, signals: dict) -> str:
+        """
+        Calculate trend based on recent changes
+        """
+        tvl_change = signals.get('tvl_change_24h', 0)
+        price_change = signals.get('price_change_24h', 0)
+        
+        avg_change = (tvl_change + price_change) / 2
+        
+        if avg_change < -5:
+            return '↓'
+        elif avg_change > 5:
+            return '↑'
+        else:
+            return '→'
+    
+    def _identify_risk_factors(self, signals: dict, health_score: int) -> list:
+        """
+        Identify specific risk factors
+        """
+        factors = []
+        
+        if signals.get('tvl_change_24h', 0) < -20:
+            factors.append(f"TVL declining {abs(signals['tvl_change_24h']):.1f}%")
+        
+        if signals.get('whale_exits', 0) > 3:
+            factors.append(f"{signals['whale_exits']} whale exits detected")
+        
+        if signals.get('liquidation_levels', 0) > 60:
+            factors.append("High liquidation risk")
+        
+        if signals.get('price_change_24h', 0) < -30:
+            factors.append(f"Token price down {abs(signals['price_change_24h']):.1f}%")
+        
+        if signals.get('dex_cex_spread', 0) > 10:
+            factors.append(f"High DEX/CEX spread: {signals['dex_cex_spread']:.1f}%")
+        
+        if signals.get('twitter_sentiment', 0) < -30:
+            factors.append("Negative social sentiment")
+        
+        if signals.get('liquidity_depth', 0) < 100000:
+            factors.append("Low liquidity depth")
+        
+        if not factors:
+            factors.append("No significant risks detected")
+        
+        return factors[:5]  # Return top 5 factors
+```
+
+```python
+# ml-service/signal_collector.py
+
+import aiohttp
+import asyncio
+
+class SignalCollector:
+    def __init__(self):
+        self.session = None
+    
+    async def collect(self, protocol_address: str) -> dict:
+        """
+        Collect all signals for a protocol
+        """
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        
+        # In production, call actual monitoring service
+        # For now, return mock data
+        signals = {
+            'tvl': 50000000,
+            'tvl_change_24h': -15.5,
+            'whale_exits': 2,
+            'liquidation_levels': 35,
+            'price': 1.02,
+            'price_change_24h': -8.3,
+            'liquidity_depth': 2500000,
+            'dex_cex_spread': 2.1,
+            'twitter_sentiment': -15,
+            'discord_activity': 65,
+            'reddit_mentions': 45
+        }
+        
+        return signals
+    
+    async def close(self):
+        if self.session:
+            await self.session.close()
+```
+
+-----
+
+### 3. Backend Routes Implementation (Day 4 Morning)
+
+```typescript
+// src/routes/index.ts
+
+import express from 'express';
+import userRoutes from './users';
+import positionRoutes from './positions';
+import protocolRoutes from './protocols';
+import rebalancingRoutes from './rebalancing';
+
+const router = express.Router();
+
+router.use('/users', userRoutes);
+router.use('/positions', positionRoutes);
+router.use('/protocols', protocolRoutes);
+router.use('/rebalancing', rebalancingRoutes);
+
+export default router;
+```
+
+```typescript
+// src/routes/positions.ts
+
+import express from 'express';
+import { db } from '../config/database';
+import { positionManagerContract } from '../config/contracts';
+import { mlService } from '../services/ml/MLServiceClient';
+import { ethers } from 'ethers';
+
+const router = express.Router();
+
+router.get('/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const result = await db.query(`
+      SELECT 
+        p.id,
+        p.protocol_name,
+        p.protocol_address,
+        p.amount,
+        p.last_health_score,
+        p.last_health_trend,
+        p.last_confidence,
+        p.last_updated
+      FROM positions p
+      WHERE p.user_id = $1 AND p.amount > 0
+      ORDER BY p.amount DESC
+    `, [userId]);
+    
+    const positions = result.rows;
+    const totalValue = positions.reduce((sum, p) => sum + Number(p.amount), 0);
+    const averageHealth = positions.length > 0
+      ? positions.reduce((sum, p) => sum + p.last_health_score, 0) / positions.length
+      : 100;
+    
+    let protectionStatus = 'active';
+    if (averageHealth < 60) protectionStatus = 'warning';
+    if (averageHealth < 40) protectionStatus = 'critical';
+    
+    res.json({
+      positions,
+      totalValue,
+      averageHealth,
+      protectionStatus,
+    });
+  } catch (error) {
+    console.error('Failed to fetch positions:', error);
+    res.status(500).json({ message: 'Failed to fetch positions' });
+  }
+});
+
+router.post('/:userId/create', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { protocolAddress, protocolName, amount } = req.body;
+    
+    // Validation
+    if (!protocolAddress || !protocolName || !amount || amount <= 0) {
+      return res.status(400).json({ message: 'Invalid input' });
+    }
+    
+    // Get user wallet
+    const user = await db.query(
+      'SELECT circle_wallet_id, wallet_address FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (user.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    // Call smart contract to create position
+    const tx = await positionManagerContract.createPosition(
+      protocolAddress,
+      ethers.utils.parseUnits(amount.toString(), 6)
+    );
+    await tx.wait();
+    
+    // Get current health score from ML service
+    const health = await mlService.predictHealth(protocolAddress);
+    
+    // Insert into database
+    const result = await db.query(`
+      INSERT INTO positions (
+        user_id, protocol_address, protocol_name, amount,
+        last_health_score, last_health_trend, last_confidence
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *
+    `, [
+      userId,
+      protocolAddress,
+      protocolName,
+      amount,
+      health.healthScore,
+      health.trend,
+      health.confidence
+    ]);
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error('Failed to create position:', error);
+    res.status(500).json({ message: 'Failed to create position' });
+  }
+});
+
+export default router;
+```
+
+```typescript
+// src/routes/protocols.ts
+
+import express from 'express';
+import { db } from '../config/database';
+import { protocolMonitor } from '../services/monitoring/ProtocolMonitor';
+import { mlService } from '../services/ml/MLServiceClient';
+
+const router = express.Router();
+
+router.get('/health', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT DISTINCT ON (protocol_address)
+        protocol_address,
+        protocol_name,
+        health_score,
+        confidence,
+        trend,
+        risk_factors,
+        tvl,
+        timestamp as last_updated
+      FROM protocol_health
+      ORDER BY protocol_address, timestamp DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Failed to fetch protocol health:', error);
+    res.status(500).json({ message: 'Failed to fetch protocol health' });
+  }
+});
+
+router.get('/:address/history', async (req, res) => {
+  try {
+    const { address } = req.params;
+    const { days = 14 } = req.query;
+    
+    const result = await db.query(`
+      SELECT
+        timestamp,
+        health_score,
+        confidence,
+        risk_factors
+      FROM protocol_health
+      WHERE protocol_address = $1
+        AND timestamp >= NOW() - INTERVAL '${days} days'
+      ORDER BY timestamp ASC
+    `, [address]);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Failed to fetch protocol history:', error);
+    res.status(500).json({ message: 'Failed to fetch protocol history' });
+  }
+});
+
+router.post('/update-health', async (req, res) => {
+  try {
+    const { protocolAddress, protocolName } = req.body;
+    
+    // Collect signals
+    const onChainSignals = await protocolMonitor.collectOnChainSignals(protocolAddress);
+    const priceSignals = await protocolMonitor.collectPriceSignals(protocolAddress);
+    const socialSignals = await protocolMonitor.collectSocialSignals(protocolName);
+    
+    const signals = {
+      ...onChainSignals,
+      ...priceSignals,
+      ...socialSignals,
+    };
+    
+    // Get ML prediction
+    const prediction = await mlService.predictHealth(protocolAddress);
+    
+    // Store in database
+    await db.query(`
+      INSERT INTO protocol_health (
+        protocol_address, protocol_name, health_score, confidence,
+        trend, risk_factors, signals, tvl
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `, [
+      protocolAddress,
+      protocolName,
+      prediction.healthScore,
+      prediction.confidence,
+      prediction.trend,
+      JSON.stringify(prediction.riskFactors),
+      JSON.stringify(signals),
+      onChainSignals.tvl
+    ]);
+    
+    res.json(prediction);
+  } catch (error) {
+    console.error('Failed to update health:', error);
+    res.status(500).json({ message: 'Failed to update health' });
+  }
+});
+
+export default router;
+```
+
+-----
+
+### 4. Main Application Setup (Day 1 & 4)
+
+```typescript
+// src/app.ts
+
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import http from 'http';
+import routes from './routes';
+import { WebSocketServer } from './services/websocket/server';
+import { AutomationEngine } from './services/automation/AutomationEngine';
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Middleware
+app.use(helmet());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true,
+}));
+app.use(express.json());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+});
+app.use('/api/', limiter);
+
+// Routes
+app.use('/api', routes);
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// Error handling
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ message: 'Internal server error' });
+});
+
+// Create HTTP server
+const httpServer = http.createServer(app);
+
+// Initialize WebSocket server
+const wsServer = new WebSocketServer(httpServer);
+export { wsServer };
+
+// Initialize automation engine
+const automationEngine = new AutomationEngine();
+
+// Start server
+httpServer.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  
+  // Start automation loop
+  await automationEngine.startMonitoringLoop();
+  console.log('✅ Monitoring loop started');
+});
+
+export default app;
+```
+
+```typescript
+// src/config/database.ts
+
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: parseInt(process.env.DB_PORT || '5432'),
+  database: process.env.DB_NAME || 'sentinelai',
+  user: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASSWORD || 'postgres',
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+export const db = {
+  query: (text: string, params?: any[]) => pool.query(text, params),
+  getClient: () => pool.connect(),
+};
+
+// Test connection
+pool.on('connect', () => {
+  console.log('✅ Database connected');
+});
+
+pool.on('error', (err) => {
+  console.error('❌ Database error:', err);
+});
+```
+
+```typescript
+// src/config/contracts.ts
+
+import { ethers } from 'ethers';
+import PositionManagerABI from '../../contracts/artifacts/PositionManager.json';
+import RiskRegistryABI from '../../contracts/artifacts/RiskRegistry.json';
+
+const provider = new ethers.providers.JsonRpcProvider(
+  process.env.ARC_RPC_URL || 'https://rpc.arc.testnet'
+);
+
+const wallet = new ethers.Wallet(process.env.DEPLOYER_PRIVATE_KEY!, provider);
+
+export const positionManagerContract = new ethers.Contract(
+  process.env.POSITION_MANAGER_ADDRESS!,
+  PositionManagerABI.abi,
+  wallet
+);
+
+export const riskRegistryContract = new ethers.Contract(
+  process.env.RISK_REGISTRY_ADDRESS!,
+  RiskRegistryABI.abi,
+  wallet
+);
+```
+
+-----
+
+## Environment Variables
+
+```env
+# .env
+
+# Server
+PORT=3001
+NODE_ENV=development
+FRONTEND_URL=http://localhost:3000
+
+# Database
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=sentinelai
+DB_USER=postgres
+DB_PASSWORD=postgres
+
+# Redis
+REDIS_HOST=localhost
+REDIS_PORT=6379
+
+# Circle
+CIRCLE_API_KEY=your_circle_api_key
+ENTITY_SECRET=your_entity_secret
+USDC_ARC_ADDRESS=0x...
+```
