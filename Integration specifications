@@ -1,0 +1,2039 @@
+# SentinelAI Frontend-Backend Integration Specification
+
+## Overview
+
+This document provides complete instructions for connecting the SentinelAI frontend with the backend, including API contracts, authentication, real-time updates, error handling, and end-to-end workflows.
+
+## Architecture Flow
+
+```
+Frontend (React) ↔ REST API (Express) ↔ ML Service (FastAPI) ↔ Smart Contracts (Solidity) ↔ Circle Wallets
+                 ↔ WebSocket Server
+                 ↔ PostgreSQL Database
+                 ↔ Redis Queue
+```
+
+## API Contract Specification
+
+### Base Configuration
+
+**Backend URL**: `https://api.sentinelai.com` (production) or `http://localhost:3001` (development)
+
+**Frontend API Client Setup** (Day 4 Morning):
+
+```typescript
+// src/services/api/client.ts
+
+import axios, { AxiosInstance, AxiosError } from 'axios';
+
+const BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+
+class APIClient {
+  private client: AxiosInstance;
+  
+  constructor() {
+    this.client = axios.create({
+      baseURL: BASE_URL,
+      timeout: 30000,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+    
+    // Request interceptor for auth
+    this.client.interceptors.request.use((config) => {
+      const walletAddress = localStorage.getItem('walletAddress');
+      if (walletAddress) {
+        config.headers['X-Wallet-Address'] = walletAddress;
+      }
+      return config;
+    });
+    
+    // Response interceptor for error handling
+    this.client.interceptors.response.use(
+      (response) => response,
+      (error: AxiosError) => {
+        return this.handleError(error);
+      }
+    );
+  }
+  
+  private handleError(error: AxiosError) {
+    if (error.response) {
+      // Server responded with error status
+      const { status, data } = error.response;
+      
+      switch (status) {
+        case 400:
+          throw new Error(data.message || 'Invalid request');
+        case 401:
+          // Clear auth and redirect to connect wallet
+          localStorage.removeItem('walletAddress');
+          window.location.href = '/connect';
+          throw new Error('Unauthorized');
+        case 404:
+          throw new Error(data.message || 'Resource not found');
+        case 500:
+          throw new Error('Server error. Please try again later.');
+        default:
+          throw new Error(data.message || 'An error occurred');
+      }
+    } else if (error.request) {
+      // No response received
+      throw new Error('Network error. Please check your connection.');
+    } else {
+      throw new Error('An unexpected error occurred');
+    }
+  }
+  
+  get axiosInstance() {
+    return this.client;
+  }
+}
+
+export const apiClient = new APIClient().axiosInstance;
+```
+
+## Complete API Endpoints
+
+### 1. User Management
+
+#### POST `/api/users/register`
+
+**Purpose**: Register new user with Circle wallet
+**Called**: When user first connects wallet
+
+**Frontend Request**:
+
+```typescript
+// src/services/api/users.ts
+
+interface RegisterUserRequest {
+  walletAddress?: string; // Optional, backend can generate
+}
+
+interface RegisterUserResponse {
+  userId: string;
+  circleWalletId: string;
+  walletAddress: string;
+  riskTolerance: 'conservative' | 'moderate' | 'aggressive';
+  createdAt: string;
+}
+
+export const registerUser = async (data?: RegisterUserRequest): Promise<RegisterUserResponse> => {
+  const response = await apiClient.post('/api/users/register', data);
+  return response.data;
+};
+
+// Usage in component
+const handleConnect = async () => {
+  try {
+    setLoading(true);
+    const user = await registerUser();
+    localStorage.setItem('walletAddress', user.walletAddress);
+    localStorage.setItem('userId', user.userId);
+    navigate('/dashboard');
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    setLoading(false);
+  }
+};
+```
+
+**Backend Implementation** (Day 4 Morning):
+
+```typescript
+// src/routes/users.ts
+
+router.post('/register', async (req, res) => {
+  try {
+    const { walletAddress } = req.body;
+    
+    // Create Circle wallet
+    const wallet = await walletService.createUserWallet();
+    
+    // Create user in database
+    const user = await db.query(`
+      INSERT INTO users (circle_wallet_id, wallet_address, risk_tolerance)
+      VALUES ($1, $2, 'moderate')
+      RETURNING id, circle_wallet_id, wallet_address, risk_tolerance, created_at
+    `, [wallet.id, wallet.address]);
+    
+    res.status(201).json({
+      userId: user.rows[0].id,
+      circleWalletId: user.rows[0].circle_wallet_id,
+      walletAddress: user.rows[0].wallet_address,
+      riskTolerance: user.rows[0].risk_tolerance,
+      createdAt: user.rows[0].created_at,
+    });
+  } catch (error) {
+    console.error('User registration error:', error);
+    res.status(500).json({ message: 'Failed to register user' });
+  }
+});
+```
+
+#### GET `/api/users/:userId`
+
+**Purpose**: Get user details and settings
+
+**Frontend Request**:
+
+```typescript
+interface UserDetails {
+  userId: string;
+  walletAddress: string;
+  circleWalletId: string;
+  riskTolerance: 'conservative' | 'moderate' | 'aggressive';
+  exitThresholds: {
+    critical: number;
+    high: number;
+    medium: number;
+  };
+  notificationSettings: {
+    email: boolean;
+    push: boolean;
+    sms: boolean;
+  };
+}
+
+export const getUserDetails = async (userId: string): Promise<UserDetails> => {
+  const response = await apiClient.get(`/api/users/${userId}`);
+  return response.data;
+};
+```
+
+**Backend Implementation**:
+
+```typescript
+router.get('/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const result = await db.query(`
+      SELECT id, wallet_address, circle_wallet_id, risk_tolerance, 
+             exit_thresholds, notification_settings
+      FROM users 
+      WHERE id = $1
+    `, [userId]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    res.json({
+      userId: result.rows[0].id,
+      walletAddress: result.rows[0].wallet_address,
+      circleWalletId: result.rows[0].circle_wallet_id,
+      riskTolerance: result.rows[0].risk_tolerance,
+      exitThresholds: result.rows[0].exit_thresholds,
+      notificationSettings: result.rows[0].notification_settings,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch user' });
+  }
+});
+```
+
+#### PUT `/api/users/:userId/settings`
+
+**Purpose**: Update user settings
+
+**Frontend Request**:
+
+```typescript
+interface UpdateSettingsRequest {
+  riskTolerance?: 'conservative' | 'moderate' | 'aggressive';
+  exitThresholds?: {
+    critical: number;
+    high: number;
+    medium: number;
+  };
+  notificationSettings?: {
+    email: boolean;
+    push: boolean;
+    sms: boolean;
+  };
+}
+
+export const updateUserSettings = async (
+  userId: string,
+  settings: UpdateSettingsRequest
+): Promise<UserDetails> => {
+  const response = await apiClient.put(`/api/users/${userId}/settings`, settings);
+  return response.data;
+};
+
+// Usage in Settings page
+const handleSaveSettings = async () => {
+  try {
+    setSaving(true);
+    const updated = await updateUserSettings(userId, {
+      riskTolerance: selectedTolerance,
+      exitThresholds: thresholds,
+      notificationSettings: notifications,
+    });
+    showSuccess('Settings saved successfully');
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    setSaving(false);
+  }
+};
+```
+
+### 2. Positions Management
+
+#### GET `/api/positions/:userId`
+
+**Purpose**: Get all user positions with current health scores
+
+**Frontend Request**:
+
+```typescript
+interface Position {
+  id: string;
+  protocolName: string;
+  protocolAddress: string;
+  amount: number;
+  lastHealthScore: number;
+  lastHealthTrend: '↑' | '↓' | '→';
+  lastConfidence: number;
+  lastUpdated: string;
+}
+
+interface PositionsResponse {
+  positions: Position[];
+  totalValue: number;
+  averageHealth: number;
+  protectionStatus: 'active' | 'warning' | 'critical';
+}
+
+export const getPositions = async (userId: string): Promise<PositionsResponse> => {
+  const response = await apiClient.get(`/api/positions/${userId}`);
+  return response.data;
+};
+
+// React Query hook for positions
+export const usePositions = (userId: string) => {
+  return useQuery(
+    ['positions', userId],
+    () => getPositions(userId),
+    {
+      refetchInterval: 30000, // Poll every 30 seconds
+      refetchOnWindowFocus: true,
+      staleTime: 20000,
+    }
+  );
+};
+
+// Usage in Dashboard
+const Dashboard = () => {
+  const userId = localStorage.getItem('userId');
+  const { data, isLoading, error } = usePositions(userId);
+  
+  if (isLoading) return <LoadingSkeleton />;
+  if (error) return <ErrorState message={error.message} />;
+  
+  return (
+    <div>
+      <PortfolioOverview 
+        totalValue={data.totalValue}
+        protectionStatus={data.protectionStatus}
+      />
+      {data.positions.map(position => (
+        <PositionCard key={position.id} position={position} />
+      ))}
+    </div>
+  );
+};
+```
+
+**Backend Implementation** (Day 4 Morning):
+
+```typescript
+router.get('/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const result = await db.query(`
+      SELECT 
+        p.id,
+        p.protocol_name,
+        p.protocol_address,
+        p.amount,
+        p.last_health_score,
+        p.last_health_trend,
+        p.last_confidence,
+        p.last_updated
+      FROM positions p
+      WHERE p.user_id = $1
+      ORDER BY p.amount DESC
+    `, [userId]);
+    
+    const positions = result.rows;
+    const totalValue = positions.reduce((sum, p) => sum + Number(p.amount), 0);
+    const averageHealth = positions.length > 0
+      ? positions.reduce((sum, p) => sum + p.last_health_score, 0) / positions.length
+      : 100;
+    
+    let protectionStatus = 'active';
+    if (averageHealth < 60) protectionStatus = 'warning';
+    if (averageHealth < 40) protectionStatus = 'critical';
+    
+    res.json({
+      positions,
+      totalValue,
+      averageHealth,
+      protectionStatus,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch positions' });
+  }
+});
+```
+
+#### POST `/api/positions/:userId/create`
+
+**Purpose**: Create new position (deposit to protocol)
+
+**Frontend Request**:
+
+```typescript
+interface CreatePositionRequest {
+  protocolAddress: string;
+  protocolName: string;
+  amount: number;
+}
+
+export const createPosition = async (
+  userId: string,
+  data: CreatePositionRequest
+): Promise<Position> => {
+  const response = await apiClient.post(`/api/positions/${userId}/create`, data);
+  return response.data;
+};
+```
+
+**Backend Implementation**:
+
+```typescript
+router.post('/:userId/create', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { protocolAddress, protocolName, amount } = req.body;
+    
+    // Get user wallet
+    const user = await db.query('SELECT circle_wallet_id FROM users WHERE id = $1', [userId]);
+    
+    // Call smart contract to create position
+    const tx = await positionManagerContract.createPosition(
+      protocolAddress,
+      ethers.utils.parseUnits(amount.toString(), 6)
+    );
+    await tx.wait();
+    
+    // Get current health score
+    const health = await mlService.predictHealth(protocolAddress);
+    
+    // Insert into database
+    const result = await db.query(`
+      INSERT INTO positions (user_id, protocol_address, protocol_name, amount, last_health_score, last_health_trend, last_confidence)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *
+    `, [userId, protocolAddress, protocolName, amount, health.score, health.trend, health.confidence]);
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to create position' });
+  }
+});
+```
+
+### 3. Protocol Health Monitoring
+
+#### GET `/api/protocols/health`
+
+**Purpose**: Get health scores for all monitored protocols
+
+**Frontend Request**:
+
+```typescript
+interface ProtocolHealth {
+  protocolAddress: string;
+  protocolName: string;
+  healthScore: number;
+  confidence: number;
+  trend: '↑' | '↓' | '→';
+  riskFactors: string[];
+  tvl: number;
+  lastUpdated: string;
+}
+
+export const getProtocolsHealth = async (): Promise<ProtocolHealth[]> => {
+  const response = await apiClient.get('/api/protocols/health');
+  return response.data;
+};
+
+// React Query hook
+export const useProtocolsHealth = () => {
+  return useQuery(
+    'protocols-health',
+    getProtocolsHealth,
+    {
+      refetchInterval: 60000, // Every minute
+    }
+  );
+};
+
+// Usage in Protocol Health page
+const ProtocolHealthPage = () => {
+  const { data, isLoading } = useProtocolsHealth();
+  
+  if (isLoading) return <LoadingSkeleton />;
+  
+  return (
+    <ProtocolGrid>
+      {data.map(protocol => (
+        <ProtocolCard key={protocol.protocolAddress} protocol={protocol} />
+      ))}
+    </ProtocolGrid>
+  );
+};
+```
+
+**Backend Implementation** (Day 4 Afternoon):
+
+```typescript
+router.get('/health', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT DISTINCT ON (protocol_address)
+        protocol_address,
+        protocol_name,
+        health_score,
+        confidence,
+        trend,
+        risk_factors,
+        tvl,
+        timestamp as last_updated
+      FROM protocol_health
+      ORDER BY protocol_address, timestamp DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch protocol health' });
+  }
+});
+```
+
+#### GET `/api/protocols/:address/history`
+
+**Purpose**: Get historical health scores for a protocol
+
+**Frontend Request**:
+
+```typescript
+interface HealthHistory {
+  timestamp: string;
+  healthScore: number;
+  confidence: number;
+  riskFactors: string[];
+}
+
+export const getProtocolHistory = async (
+  address: string,
+  days: number = 14
+): Promise<HealthHistory[]> => {
+  const response = await apiClient.get(`/api/protocols/${address}/history`, {
+    params: { days },
+  });
+  return response.data;
+};
+
+// Usage in Protocol Detail modal
+const ProtocolDetailModal = ({ protocol }) => {
+  const { data: history } = useQuery(
+    ['protocol-history', protocol.address],
+    () => getProtocolHistory(protocol.address, 14)
+  );
+  
+  return (
+    <Modal>
+      <ProtocolHealthChart data={history} />
+    </Modal>
+  );
+};
+```
+
+### 4. Rebalancing & Actions
+
+#### GET `/api/rebalancing/:userId/history`
+
+**Purpose**: Get rebalancing action history
+
+**Frontend Request**:
+
+```typescript
+interface RebalancingAction {
+  id: string;
+  fromProtocol: string;
+  fromProtocolName: string;
+  toProtocols: Array<{
+    address: string;
+    name: string;
+    amount: number;
+  }>;
+  amountExited: number;
+  exitPercentage: number;
+  reason: string;
+  healthScoreAtExit: number;
+  txHash: string;
+  status: 'pending' | 'completed' | 'failed';
+  executedAt: string;
+  completedAt?: string;
+}
+
+export const getRebalancingHistory = async (
+  userId: string,
+  limit: number = 50
+): Promise<RebalancingAction[]> => {
+  const response = await apiClient.get(`/api/rebalancing/${userId}/history`, {
+    params: { limit },
+  });
+  return response.data;
+};
+
+// React Query hook
+export const useRebalancingHistory = (userId: string) => {
+  return useQuery(
+    ['rebalancing-history', userId],
+    () => getRebalancingHistory(userId),
+    {
+      refetchInterval: 30000,
+    }
+  );
+};
+
+// Usage in Dashboard
+const RecentActionsTimeline = ({ userId }) => {
+  const { data: actions } = useRebalancingHistory(userId);
+  
+  return (
+    <Timeline>
+      {actions?.map(action => (
+        <TimelineItem key={action.id}>
+          <ActionCard action={action} />
+        </TimelineItem>
+      ))}
+    </Timeline>
+  );
+};
+```
+
+**Backend Implementation**:
+
+```typescript
+router.get('/:userId/history', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { limit = 50 } = req.query;
+    
+    const result = await db.query(`
+      SELECT * FROM rebalancing_history
+      WHERE user_id = $1
+      ORDER BY executed_at DESC
+      LIMIT $2
+    `, [userId, limit]);
+    
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch history' });
+  }
+});
+```
+
+#### POST `/api/rebalancing/execute`
+
+**Purpose**: Manually trigger rebalancing (called by automation engine or user)
+
+**Backend Implementation** (Day 4 Afternoon):
+
+```typescript
+router.post('/execute', async (req, res) => {
+  try {
+    const { userId, protocolAddress, exitPercentage, reason } = req.body;
+    
+    // Get position
+    const position = await db.query(`
+      SELECT * FROM positions 
+      WHERE user_id = $1 AND protocol_address = $2
+    `, [userId, protocolAddress]);
+    
+    if (position.rows.length === 0) {
+      return res.status(404).json({ message: 'Position not found' });
+    }
+    
+    const pos = position.rows[0];
+    const exitAmount = (pos.amount * exitPercentage) / 100;
+    
+    // Execute via smart contract
+    const tx = await positionManagerContract.executeGradualExit(
+      userId,
+      protocolAddress,
+      exitPercentage
+    );
+    await tx.wait();
+    
+    // Get safe protocols for redistribution
+    const safeProtocols = await riskRegistryContract.getSafeProtocols();
+    
+    // Redistribute funds
+    if (safeProtocols.length > 0) {
+      await positionManagerContract.redistributeToSafeProtocols(
+        userId,
+        ethers.utils.parseUnits(exitAmount.toString(), 6)
+      );
+    }
+    
+    // Record in database
+    const result = await db.query(`
+      INSERT INTO rebalancing_history (
+        user_id, from_protocol, from_protocol_name, to_protocols,
+        amount_exited, exit_percentage, reason, health_score_at_exit,
+        tx_hash, status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'completed')
+      RETURNING *
+    `, [
+      userId,
+      protocolAddress,
+      pos.protocol_name,
+      JSON.stringify(safeProtocols),
+      exitAmount,
+      exitPercentage,
+      reason,
+      pos.last_health_score,
+      tx.hash
+    ]);
+    
+    // Update position
+    await db.query(`
+      UPDATE positions 
+      SET amount = amount - $1, last_updated = NOW()
+      WHERE user_id = $2 AND protocol_address = $3
+    `, [exitAmount, userId, protocolAddress]);
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ message: 'Rebalancing failed' });
+  }
+});
+```
+
+## Real-Time Updates with WebSocket
+
+### Backend WebSocket Server Setup (Day 4 Afternoon)
+
+```typescript
+// src/services/websocket/server.ts
+
+import { Server } from 'socket.io';
+import { Server as HTTPServer } from 'http';
+
+export class WebSocketServer {
+  private io: Server;
+  
+  constructor(httpServer: HTTPServer) {
+    this.io = new Server(httpServer, {
+      cors: {
+        origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+        methods: ['GET', 'POST'],
+      },
+    });
+    
+    this.setupHandlers();
+  }
+  
+  private setupHandlers() {
+    this.io.on('connection', (socket) => {
+      console.log('Client connected:', socket.id);
+      
+      // Join user-specific room
+      socket.on('subscribe:user', (userId: string) => {
+        socket.join(`user:${userId}`);
+        console.log(`User ${userId} subscribed`);
+      });
+      
+      socket.on('disconnect', () => {
+        console.log('Client disconnected:', socket.id);
+      });
+    });
+  }
+  
+  // Emit health score updates
+  emitHealthUpdate(protocolAddress: string, health: any) {
+    this.io.emit('health:update', {
+      protocolAddress,
+      ...health,
+    });
+  }
+  
+  // Emit user-specific alerts
+  emitAlert(userId: string, alert: any) {
+    this.io.to(`user:${userId}`).emit('alert', alert);
+  }
+  
+  // Emit rebalancing notifications
+  emitRebalancing(userId: string, action: any) {
+    this.io.to(`user:${userId}`).emit('rebalancing:executed', action);
+  }
+}
+
+// Initialize in app.ts
+const httpServer = http.createServer(app);
+const wsServer = new WebSocketServer(httpServer);
+export { wsServer };
+```
+
+### Frontend WebSocket Client (Day 5 Afternoon)
+
+```typescript
+// src/services/websocket/client.ts
+
+import { io, Socket } from 'socket.io-client';
+import { toast } from 'react-toastify';
+
+const WS_URL = process.env.REACT_APP_WS_URL || 'ws://localhost:3001';
+
+class WebSocketClient {
+  private socket: Socket | null = null;
+  private userId: string | null = null;
+  
+  connect(userId: string) {
+    this.userId = userId;
+    
+    this.socket = io(WS_URL, {
+      transports: ['websocket'],
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionAttempts: 5,
+    });
+    
+    this.socket.on('connect', () => {
+      console.log('WebSocket connected');
+      this.socket?.emit('subscribe:user', userId);
+    });
+    
+    this.socket.on('disconnect', () => {
+      console.log('WebSocket disconnected');
+    });
+    
+    this.setupListeners();
+  }
+  
+  private setupListeners() {
+    // Health score updates
+    this.socket?.on('health:update', (data) => {
+      // Invalidate React Query cache
+      queryClient.invalidateQueries('protocols-health');
+      queryClient.invalidateQueries('positions');
+    });
+    
+    // Critical alerts
+    this.socket?.on('alert', (alert) => {
+      toast.error(alert.message, {
+        autoClose: false,
+        position: 'top-center',
+      });
+    });
+    
+    // Rebalancing executed
+    this.socket?.on('rebalancing:executed', (action) => {
+      toast.success(`Rebalanced ${action.exitPercentage}% from ${action.fromProtocolName}`, {
+        autoClose: 5000,
+      });
+      
+      // Refresh positions and history
+      queryClient.invalidateQueries(['positions', this.userId]);
+      queryClient.invalidateQueries(['rebalancing-history', this.userId]);
+    });
+  }
+  
+  disconnect() {
+    this.socket?.disconnect();
+    this.socket = null;
+  }
+}
+
+export const wsClient = new WebSocketClient();
+
+// Usage in App.tsx
+useEffect(() => {
+  const userId = localStorage.getItem('userId');
+  if (userId) {
+    wsClient.connect(userId);
+  }
+  
+  return () => {
+    wsClient.disconnect();
+  };
+}, []);
+```
+
+## Automation Engine Integration (Day 4 Afternoon)
+
+### Backend Monitoring Loop
+
+```typescript
+// src/services/automation/AutomationEngine.ts
+
+import Bull from 'bull';
+import { wsServer } from '../websocket/server';
+
+export class AutomationEngine {
+  private monitoringQueue: Bull.Queue;
+  
+  constructor() {
+    this.monitoringQueue = new Bull('monitoring', {
+      redis: {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: parseInt(process.env.REDIS_PORT || '6379'),
+      },
+    });
+    
+    this.setupWorkers();
+  }
+  
+  async startMonitoringLoop() {
+    // Add recurring job every hour
+    await this.monitoringQueue.add(
+      'check-all-positions',
+      {},
+      {
+        repeat: {
+          every: 3600000, // 1 hour
+        },
+      }
+    );
+    
+    console.log('Monitoring loop started');
+  }
+  
+  private setupWorkers() {
+    this.monitoringQueue.process('check-all-positions', async (job) => {
+      console.log('Running monitoring check...');
+      
+      // 1. Fetch all user positions
+      const positions = await db.query(`
+        SELECT p.*, u.risk_tolerance, u.exit_thresholds, u.circle_wallet_id
+        FROM positions p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.amount > 0
+      `);
+      
+      // 2. Check health scores for each protocol
+      for (const pos of positions.rows) {
+        const health = await mlService.predictHealth(pos.protocol_address);
+        
+        // Update database
+        await db.query(`
+          UPDATE positions
+          SET last_health_score = $1, last_health_trend = $2, last_confidence = $3, last_updated = NOW()
+          WHERE id = $4
+        `, [health.score, health.trend, health.confidence, pos.id]);
+        
+        // 3. Determine if action needed
+        const thresholds = pos.exit_thresholds;
+        let exitPercentage = 0;
+        let reason = '';
+        
+        if (health.score <= thresholds.critical) {
+          exitPercentage = 100;
+          reason = `Critical health score: ${health.score}/100`;
+        } else if (health.score <= thresholds.high) {
+          exitPercentage = this.calculateExitPercentage(health.score, thresholds.high, thresholds.critical, 50, 100);
+          reason = `High risk detected: ${health.score}/100`;
+        } else if (health.score <= thresholds.medium) {
+          exitPercentage = this.calculateExitPercentage(health.score, thresholds.medium, thresholds.high, 20, 50);
+          reason = `Moderate risk detected: ${health.score}/100`;
+        }
+        
+        // 4. Execute rebalancing if needed
+        if (exitPercentage > 0) {
+          console.log(`Rebalancing ${exitPercentage}% for user ${pos.user_id} from ${pos.protocol_name}`);
+          
+          // Send alert to user via WebSocket
+          wsServer.emitAlert(pos.user_id, {
+            type: 'rebalancing',
+            severity: exitPercentage >= 100 ? 'critical' : exitPercentage >= 50 ? 'high' : 'medium',
+            message: reason,
+            protocolName: pos.protocol_name,
+            exitPercentage,
+          });
+          
+          // Execute rebalancing
+          try {
+            await this.executeRebalancing({
+              userId: pos.user_id,
+              protocolAddress: pos.protocol_address,
+              protocolName: pos.protocol_name,
+              exitPercentage,
+              reason,
+              healthScore: health.score,
+            });
+            
+            // Notify success
+            wsServer.emitRebalancing(pos.user_id, {
+              fromProtocolName: pos.protocol_name,
+              exitPercentage,
+              reason,
+            });
+          } catch (error) {
+            console.error('Rebalancing failed:', error);
+          }
+        }
+      }
+      
+      console.log('Monitoring check completed');
+    });
+  }
+  
+  private calculateExitPercentage(
+    score: number,
+    minThreshold: number,
+    maxThreshold: number,
+    minExit: number,
+    maxExit: number
+  ): number {
+    // Linear interpolation
+    const ratio = (maxThreshold - score) / (maxThreshold - minThreshold);
+    return Math.round(minExit + (maxExit - minExit) * ratio);
+  }
+  
+  private async executeRebalancing(params: any) {
+    // Implementation from rebalancing API endpoint
+    // ... (same as POST /api/rebalancing/execute)
+  }
+}
+
+// Start in app.ts
+const automationEngine = new AutomationEngine();
+automationEngine.startMonitoringLoop();
+```
+
+## Error Handling & User Feedback
+
+### Frontend Toast Notifications
+
+```typescript
+// src/utils/notifications.ts
+
+import { toast, ToastOptions } from 'react-toastify';
+
+const defaultOptions: ToastOptions = {
+  position: 'top-right',
+  autoClose: 5000,
+  hideProgressBar: false,
+  closeOnClick: true,
+  pauseOnHover: true,
+  draggable: true,
+};
+
+export const showSuccess = (message: string) => {
+  toast.success(message, defaultOptions);
+};
+
+export const showError = (message: string) => {
+  toast.error(message, {
+    ...defaultOptions,
+    autoClose: 8000,
+  });
+};
+
+export const showWarning = (message: string) => {
+  toast.warning(message, defaultOptions);
+};
+
+export const showInfo = (message: string) => {
+  toast.info(message, defaultOptions);
+};
+
+export const showCriticalAlert = (message: string, onAction?: () => void) => {
+  toast.error(message, {
+    position: 'top-center',
+    autoClose: false,
+    closeButton: true,
+    onClick: onAction,
+  });
+};
+
+// Usage throughout app
+// Success: After successful settings save, position creation
+// Error: API failures, transaction failures
+// Warning: Low health scores, potential risks
+// Info: Background updates, general notifications
+// Critical: Emergency exits, major failures
+```
+
+### Global Error Boundary
+
+```typescript
+// src/components/ErrorBoundary.tsx
+
+import React, { Component, ErrorInfo, ReactNode } from 'react';
+
+interface Props {
+  children: ReactNode;
+}
+
+interface State {
+  hasError: boolean;
+  error: Error | null;
+}
+
+export class ErrorBoundary extends Component<Props, State> {
+  constructor(props: Props) {
+    super(props);
+    this.state = {
+      hasError: false,
+      error: null,
+    };
+  }
+
+  static getDerivedStateFromError(error: Error): State {
+    return {
+      hasError: true,
+      error,
+    };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error('Error caught by boundary:', error, errorInfo);
+    
+    // Log to monitoring service (e.g., Sentry)
+    // logErrorToService(error, errorInfo);
+  }
+
+  handleReload = () => {
+    window.location.reload();
+  };
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-900">
+          <div className="text-center p-8 bg-gray-800 rounded-lg max-w-md">
+            <div className="text-red-500 text-6xl mb-4">⚠️</div>
+            <h1 className="text-2xl font-bold text-white mb-4">
+              Something went wrong
+            </h1>
+            <p className="text-gray-400 mb-6">
+              We're sorry for the inconvenience. Please try reloading the page.
+            </p>
+            <button
+              onClick={this.handleReload}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg"
+            >
+              Reload Page
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+// Wrap App in index.tsx
+ReactDOM.render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>,
+  document.getElementById('root')
+);
+```
+
+## ML Service Integration (Day 3-4)
+
+### Backend ML Service Connector
+
+```typescript
+// src/services/ml/MLServiceClient.ts
+
+import axios from 'axios';
+
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://localhost:8000';
+
+interface HealthPrediction {
+  healthScore: number;
+  confidence: number;
+  trend: '↑' | '↓' | '→';
+  riskFactors: string[];
+  signals: {
+    onChain: any;
+    price: any;
+    social: any;
+  };
+}
+
+export class MLServiceClient {
+  private client;
+  
+  constructor() {
+    this.client = axios.create({
+      baseURL: ML_SERVICE_URL,
+      timeout: 10000,
+    });
+  }
+  
+  /**
+   * Get health prediction for a protocol
+   */
+  async predictHealth(protocolAddress: string): Promise<HealthPrediction> {
+    try {
+      const response = await this.client.post('/predict', {
+        protocol_address: protocolAddress,
+      });
+      
+      return {
+        healthScore: response.data.health_score,
+        confidence: response.data.confidence,
+        trend: response.data.trend,
+        riskFactors: response.data.risk_factors,
+        signals: response.data.signals,
+      };
+    } catch (error) {
+      console.error('ML prediction failed:', error);
+      // Return safe default
+      return {
+        healthScore: 50,
+        confidence: 0,
+        trend: '→',
+        riskFactors: ['Service unavailable'],
+        signals: {} as any,
+      };
+    }
+  }
+  
+  /**
+   * Batch predict for multiple protocols
+   */
+  async predictBatch(protocolAddresses: string[]): Promise<Map<string, HealthPrediction>> {
+    try {
+      const response = await this.client.post('/predict/batch', {
+        protocol_addresses: protocolAddresses,
+      });
+      
+      const predictions = new Map<string, HealthPrediction>();
+      response.data.predictions.forEach((pred: any) => {
+        predictions.set(pred.protocol_address, {
+          healthScore: pred.health_score,
+          confidence: pred.confidence,
+          trend: pred.trend,
+          riskFactors: pred.risk_factors,
+          signals: pred.signals,
+        });
+      });
+      
+      return predictions;
+    } catch (error) {
+      console.error('Batch prediction failed:', error);
+      return new Map();
+    }
+  }
+}
+
+export const mlService = new MLServiceClient();
+```
+
+### ML Service API Endpoints (FastAPI - Python)
+
+```python
+# ml-service/main.py
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict
+import numpy as np
+from predictor import HealthPredictor
+from signal_collector import SignalCollector
+
+app = FastAPI()
+
+predictor = HealthPredictor()
+signal_collector = SignalCollector()
+
+class PredictRequest(BaseModel):
+    protocol_address: str
+
+class BatchPredictRequest(BaseModel):
+    protocol_addresses: List[str]
+
+class PredictionResponse(BaseModel):
+    protocol_address: str
+    health_score: int
+    confidence: int
+    trend: str
+    risk_factors: List[str]
+    signals: Dict
+
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(request: PredictRequest):
+    """
+    Predict health score for a single protocol
+    """
+    try:
+        # Collect signals
+        signals = await signal_collector.collect(request.protocol_address)
+        
+        # Get prediction
+        prediction = predictor.predict(signals)
+        
+        return PredictionResponse(
+            protocol_address=request.protocol_address,
+            health_score=int(prediction['health_score']),
+            confidence=int(prediction['confidence']),
+            trend=prediction['trend'],
+            risk_factors=prediction['risk_factors'],
+            signals=signals
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict/batch")
+async def predict_batch(request: BatchPredictRequest):
+    """
+    Batch predict for multiple protocols
+    """
+    predictions = []
+    
+    for address in request.protocol_addresses:
+        try:
+            signals = await signal_collector.collect(address)
+            prediction = predictor.predict(signals)
+            
+            predictions.append({
+                "protocol_address": address,
+                "health_score": int(prediction['health_score']),
+                "confidence": int(prediction['confidence']),
+                "trend": prediction['trend'],
+                "risk_factors": prediction['risk_factors'],
+                "signals": signals
+            })
+        except Exception as e:
+            print(f"Failed to predict for {address}: {e}")
+            continue
+    
+    return {"predictions": predictions}
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint
+    """
+    return {"status": "healthy"}
+```
+
+## Circle Wallet Integration (Day 4 Afternoon)
+
+### Backend Circle Wallet Service
+
+```typescript
+// src/services/wallet/CircleWalletService.ts
+
+import { initiateDeveloperControlledWalletsClient } from '@circle-fin/developer-controlled-wallets';
+
+const CIRCLE_API_KEY = process.env.CIRCLE_API_KEY!;
+const ENTITY_SECRET = process.env.ENTITY_SECRET!;
+const USDC_ARC_ADDRESS = process.env.USDC_ARC_ADDRESS!;
+
+export class CircleWalletService {
+  private client;
+  
+  constructor() {
+    this.client = initiateDeveloperControlledWalletsClient({
+      apiKey: CIRCLE_API_KEY,
+      entitySecret: ENTITY_SECRET,
+    });
+  }
+  
+  /**
+   * Create wallet for new user
+   */
+  async createUserWallet(userId: string) {
+    try {
+      // Create wallet set
+      const walletSet = await this.client.createWalletSet({
+        name: `SentinelAI-User-${userId}`,
+      });
+      
+      // Create wallet on Arc
+      const wallet = await this.client.createWallet({
+        walletSetId: walletSet.data.walletSet.id,
+        blockchains: ['ARQ-TESTNET'], // Change to ARQ-MAINNET for production
+        count: 1,
+      });
+      
+      return {
+        id: wallet.data.wallets[0].id,
+        address: wallet.data.wallets[0].address,
+        blockchain: wallet.data.wallets[0].blockchain,
+      };
+    } catch (error) {
+      console.error('Failed to create wallet:', error);
+      throw new Error('Wallet creation failed');
+    }
+  }
+  
+  /**
+   * Execute emergency exit transaction
+   */
+  async executeEmergencyExit(
+    fromWalletId: string,
+    toAddress: string,
+    amount: string,
+    protocolName: string
+  ) {
+    try {
+      const tx = await this.client.createTransaction({
+        walletId: fromWalletId,
+        blockchain: 'ARQ-TESTNET',
+        tokenAddress: USDC_ARC_ADDRESS,
+        destinationAddress: toAddress,
+        amount: amount,
+        feeLevel: 'HIGH', // Fast confirmation for emergencies
+        metadata: [
+          {
+            key: 'transactionType',
+            value: 'emergency_exit',
+          },
+          {
+            key: 'protocol',
+            value: protocolName,
+          },
+          {
+            key: 'timestamp',
+            value: new Date().toISOString(),
+          },
+        ],
+      });
+      
+      return {
+        txHash: tx.data.transaction.txHash,
+        state: tx.data.transaction.state,
+        blockchain: tx.data.transaction.blockchain,
+      };
+    } catch (error) {
+      console.error('Transaction failed:', error);
+      throw new Error('Emergency exit transaction failed');
+    }
+  }
+  
+  /**
+   * Stream funds to safer protocols
+   */
+  async rebalanceToSafeProtocols(
+    fromWalletId: string,
+    distributions: Array<{ address: string; amount: string; protocolName: string }>
+  ) {
+    try {
+      const transactions = [];
+      
+      for (const dist of distributions) {
+        const tx = await this.client.createTransaction({
+          walletId: fromWalletId,
+          blockchain: 'ARQ-TESTNET',
+          tokenAddress: USDC_ARC_ADDRESS,
+          destinationAddress: dist.address,
+          amount: dist.amount,
+          feeLevel: 'MEDIUM',
+          metadata: [
+            {
+              key: 'transactionType',
+              value: 'rebalancing',
+            },
+            {
+              key: 'targetProtocol',
+              value: dist.protocolName,
+            },
+          ],
+        });
+        
+        transactions.push({
+          protocol: dist.protocolName,
+          txHash: tx.data.transaction.txHash,
+          amount: dist.amount,
+        });
+      }
+      
+      return transactions;
+    } catch (error) {
+      console.error('Rebalancing failed:', error);
+      throw new Error('Rebalancing transaction failed');
+    }
+  }
+  
+  /**
+   * Get wallet balance
+   */
+  async getBalance(walletId: string) {
+    try {
+      const wallet = await this.client.getWallet({ id: walletId });
+      
+      // Find USDC balance
+      const usdcBalance = wallet.data.wallet.balances?.find(
+        (b) => b.token.symbol === 'USDC'
+      );
+      
+      return {
+        balance: usdcBalance?.amount || '0',
+        blockchain: wallet.data.wallet.blockchain,
+      };
+    } catch (error) {
+      console.error('Failed to get balance:', error);
+      return { balance: '0', blockchain: 'ARQ-TESTNET' };
+    }
+  }
+}
+
+export const circleWalletService = new CircleWalletService();
+```
+
+## Demo Mode Implementation (Day 6)
+
+### Backend Demo Data Seeder
+
+```typescript
+// src/scripts/seedDemoData.ts
+
+import { db } from '../config/database';
+
+interface DemoScenario {
+  day: number;
+  healthScore: number;
+  exitPercentage: number;
+  events: string[];
+}
+
+const DEMO_SCENARIO: DemoScenario[] = [
+  {
+    day: 0,
+    healthScore: 85,
+    exitPercentage: 0,
+    events: ['Portfolio healthy', 'All protocols stable'],
+  },
+  {
+    day: 1,
+    healthScore: 65,
+    exitPercentage: 0,
+    events: ['Arc Lend health declining', 'TVL dropped 15%', 'Warning alert sent'],
+  },
+  {
+    day: 3,
+    healthScore: 55,
+    exitPercentage: 0,
+    events: ['Health continues to decline', 'Whale wallets exiting'],
+  },
+  {
+    day: 4,
+    healthScore: 38,
+    exitPercentage: 30,
+    events: ['Automatic exit triggered: 30%', '$30K moved to safe protocols'],
+  },
+  {
+    day: 5,
+    healthScore: 25,
+    exitPercentage: 70,
+    events: ['Critical risk detected', 'Aggressive exit: 70%', '$70K secured'],
+  },
+  {
+    day: 7,
+    healthScore: 5,
+    exitPercentage: 100,
+    events: ['Protocol collapsed', 'Emergency exit: 100%', 'Final $10K salvaged', 'Total saved: $94K'],
+  },
+];
+
+async function seedDemoData() {
+  // Create demo user
+  const user = await db.query(`
+    INSERT INTO users (circle_wallet_id, wallet_address, risk_tolerance)
+    VALUES ('demo_wallet', '0xDEMO123456', 'moderate')
+    RETURNING id
+  `);
+  
+  const userId = user.rows[0].id;
+  
+  // Create demo positions
+  const positions = [
+    { protocol: '0xArcLend', name: 'Arc Lend', amount: 100000 },
+    { protocol: '0xArcSwap', name: 'Arc Swap', amount: 50000 },
+    { protocol: '0xArcVault', name: 'Arc Vault', amount: 30000 },
+  ];
+  
+  for (const pos of positions) {
+    await db.query(`
+      INSERT INTO positions (user_id, protocol_address, protocol_name, amount, last_health_score, last_health_trend)
+      VALUES ($1, $2, $3, $4, 85, '→')
+    `, [userId, pos.protocol, pos.name, pos.amount]);
+  }
+  
+  // Create demo protocol health history
+  for (const scenario of DEMO_SCENARIO) {
+    await db.query(`
+      INSERT INTO protocol_health (
+        protocol_address, protocol_name, health_score, confidence, trend, 
+        risk_factors, signals, timestamp
+      ) VALUES (
+        '0xArcLend', 'Arc Lend', $1, 90, '↓',
+        $2, '{}', NOW() - INTERVAL '${7 - scenario.day} days'
+      )
+    `, [
+      scenario.healthScore,
+      JSON.stringify(scenario.events),
+    ]);
+    
+    // Create rebalancing actions
+    if (scenario.exitPercentage > 0) {
+      await db.query(`
+        INSERT INTO rebalancing_history (
+          user_id, from_protocol, from_protocol_name, to_protocols,
+          amount_exited, exit_percentage, reason, health_score_at_exit,
+          tx_hash, status, executed_at
+        ) VALUES (
+          $1, '0xArcLend', 'Arc Lend', '[]',
+          $2, $3, $4, $5, 
+          'demo_tx_${scenario.day}', 'completed',
+          NOW() - INTERVAL '${7 - scenario.day} days'
+        )
+      `, [
+        userId,
+        scenario.exitPercentage * 1000,
+        scenario.exitPercentage,
+        scenario.events[0],
+        scenario.healthScore,
+      ]);
+    }
+  }
+  
+  console.log('Demo data seeded successfully');
+  console.log('Demo User ID:', userId);
+}
+
+seedDemoData();
+```
+
+### Frontend Demo Playback Component
+
+```typescript
+// src/components/Demo/DemoPlayback.tsx
+
+import React, { useState, useEffect } from 'react';
+
+interface DemoState {
+  currentDay: number;
+  isPlaying: boolean;
+  speed: 1 | 5 | 10;
+}
+
+export const DemoPlayback: React.FC = () => {
+  const [demo, setDemo] = useState<DemoState>({
+    currentDay: 0,
+    isPlaying: false,
+    speed: 5,
+  });
+  
+  const [narration, setNarration] = useState<string>('');
+  
+  const NARRATIONS = {
+    0: 'Meet Alex, a DeFi investor with $100K across 5 Arc protocols. Everything looks healthy...',
+    1: 'Day 1: Arc Lend health drops from 85 to 65. SentinelAI detects elevated risk.',
+    3: 'Day 3: Score drops to 55, then 38. System begins gradual exit: 30% withdrawn.',
+    4: 'Day 4: Health continues declining. 30% of funds secured.',
+    5: 'Day 5: Score plummets to 25. Aggressive exit: 70% total withdrawn.',
+    7: 'Day 7: Arc Lend collapses. Emergency exit salvages final 10%. Total saved: $94K vs $10K without protection.',
+  };
+  
+  useEffect(() => {
+    if (demo.isPlaying) {
+      const interval = setInterval(() => {
+        setDemo(prev => {
+          const nextDay = prev.currentDay + 1;
+          if (nextDay > 7) {
+            return { ...prev, isPlaying: false };
+          }
+          setNarration(NARRATIONS[nextDay] || '');
+          return { ...prev, currentDay: nextDay };
+        });
+      }, 2000 / demo.speed); // Faster with higher speed
+      
+      return () => clearInterval(interval);
+    }
+  }, [demo.isPlaying, demo.speed]);
+  
+  const handlePlay = () => {
+    setDemo(prev => ({ ...prev, isPlaying: true }));
+  };
+  
+  const handlePause = () => {
+    setDemo(prev => ({ ...prev, isPlaying: false }));
+  };
+  
+  const handleReset = () => {
+    setDemo({ currentDay: 0, isPlaying: false, speed: 5 });
+    setNarration('');
+  };
+  
+  const handleSpeedChange = (speed: 1 | 5 | 10) => {
+    setDemo(prev => ({ ...prev, speed }));
+  };
+  
+  return (
+    <div className="fixed bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-800 p-4 rounded-lg shadow-xl z-50">
+      <div className="flex items-center space-x-4">
+        <div className="text-white font-semibold">
+          Demo Mode - Day {demo.currentDay}/7
+        </div>
+        
+        <div className="flex space-x-2">
+          {!demo.isPlaying ? (
+            <button
+              onClick={handlePlay}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded"
+            >
+              ▶ Play
+            </button>
+          ) : (
+            <button
+              onClick={handlePause}
+              className="bg-yellow-600 hover:bg-yellow-700 text-white px-4 py-2 rounded"
+            >
+              ⏸ Pause
+            </button>
+          )}
+          
+          <button
+            onClick={handleReset}
+            className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded"
+          >
+            ↻ Reset
+          </button>
+        </div>
+        
+        <div className="flex items-center space-x-2">
+          <span className="text-gray-400 text-sm">Speed:</span>
+          {[1, 5, 10].map((speed) => (
+            <button
+              key={speed}
+              onClick={() => handleSpeedChange(speed as 1 | 5 | 10)}
+              className={`px-3 py-1 rounded ${
+                demo.speed === speed
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              }`}
+            >
+              {speed}x
+            </button>
+          ))}
+        </div>
+      </div>
+      
+      {narration && (
+        <div className="mt-4 p-3 bg-gray-900 rounded text-white text-sm">
+          {narration}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Wrap Dashboard with demo mode
+const Dashboard = () => {
+  const isDemoMode = localStorage.getItem('demoMode') === 'true';
+  
+  return (
+    <>
+      <DashboardContent />
+      {isDemoMode && <DemoPlayback />}
+    </>
+  );
+};
+```
+
+## Testing & Validation (Day 7 Morning)
+
+### Integration Test Suite
+
+```typescript
+// tests/integration/full-flow.test.ts
+
+import { apiClient } from '../../src/services/api/client';
+import { circleWalletService } from '../../src/services/wallet/CircleWalletService';
+import { mlService } from '../../src/services/ml/MLServiceClient';
+
+describe('End-to-End Flow', () => {
+  let userId: string;
+  let walletId: string;
+  
+  it('should register user and create wallet', async () => {
+    const response = await apiClient.post('/api/users/register');
+    
+    expect(response.status).toBe(201);
+    expect(response.data.userId).toBeDefined();
+    expect(response.data.walletAddress).toBeDefined();
+    
+    userId = response.data.userId;
+    walletId = response.data.circleWalletId;
+  });
+  
+  it('should create position', async () => {
+    const response = await apiClient.post(`/api/positions/${userId}/create`, {
+      protocolAddress: '0xTestProtocol',
+      protocolName: 'Test Protocol',
+      amount: 1000,
+    });
+    
+    expect(response.status).toBe(201);
+    expect(response.data.amount).toBe(1000);
+  });
+  
+  it('should get ML prediction', async () => {
+    const prediction = await mlService.predictHealth('0xTestProtocol');
+    
+    expect(prediction.healthScore).toBeGreaterThanOrEqual(0);
+    expect(prediction.healthScore).toBeLessThanOrEqual(100);
+    expect(prediction.confidence).toBeGreaterThanOrEqual(0);
+  });
+  
+  it('should execute rebalancing', async () => {
+    const response = await apiClient.post('/api/rebalancing/execute', {
+      userId,
+      protocolAddress: '0xTestProtocol',
+      exitPercentage: 30,
+      reason: 'Test rebalancing',
+    });
+    
+    expect(response.status).toBe(200);
+    expect(response.data.exitPercentage).toBe(30);
+    expect(response.data.txHash).toBeDefined();
+  });
+  
+  it('should fetch rebalancing history', async () => {
+    const response = await apiClient.get(`/api/rebalancing/${userId}/history`);
+    
+    expect(response.status).toBe(200);
+    expect(response.data.length).toBeGreaterThan(0);
+  });
+});
+```
+
+## Deployment Checklist (Day 7 Afternoon)
+
+### Backend Deployment to Railway
+
+```bash
+# 1. Install Railway CLI
+npm install -g @railway/cli
+
+# 2. Login
+railway login
+
+# 3. Initialize project
+railway init
+
+# 4. Add PostgreSQL
+railway add postgresql
+
+# 5. Add Redis
+railway add redis
+
+# 6. Set environment variables
+railway variables set CIRCLE_API_KEY=your_key
+railway variables set ENTITY_SECRET=your_secret
+railway variables set USDC_ARC_ADDRESS=0x...
+railway variables set ML_SERVICE_URL=https://ml-service.com
+railway variables set FRONTEND_URL=https://sentinelai.vercel.app
+
+# 7. Deploy
+railway up
+```
+
+### Frontend Deployment to Vercel
+
+```bash
+# 1. Install Vercel CLI
+npm install -g vercel
+
+# 2. Login
+vercel login
+
+# 3. Deploy
+vercel
+
+# 4. Set environment variables in Vercel dashboard
+REACT_APP_API_URL=https://api-sentinelai.railway.app
+REACT_APP_WS_URL=wss://api-sentinelai.railway.app
+REACT_APP_CIRCLE_API_KEY=your_key
+REACT_APP_ARC_EXPLORER_URL=https://explorer.arc.network
+```
+
+### ML Service Deployment to Hugging Face
+
+```python
+# requirements.txt
+fastapi==0.104.1
+uvicorn==0.24.0
+numpy==1.24.3
+scikit-learn==1.3.2
+pandas==2.1.3
+tensorflow==2.15.0
+```
+
+```dockerfile
+# Dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+## Performance Monitoring
+
+### Add monitoring to all API endpoints
+
+```typescript
+// src/middleware/monitoring.ts
+
+import { Request, Response, NextFunction } from 'express';
+
+export const monitoringMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const start = Date.now();
+  
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    
+    // Log slow requests
+    if (duration > 1000) {
+      console.warn(`Slow request: ${req.method} ${req.path} - ${duration}ms`);
+    }
+    
+    // Log errors
+    if (res.statusCode >= 400) {
+      console.error(`Error response: ${req.method} ${req.path} - ${res.statusCode}`);
+    }
+    
+    // Send to monitoring service (e.g., Datadog, New Relic)
+    // monitoringService.track({
+    //   method: req.method,
+    //   path: req.path,
+    //   statusCode: res.statusCode,
+    //   duration,
+    // });
+  });
+  
+  next();
+};
+
+// Apply to all routes
+app.use(monitoringMiddleware);
+```
+
+## Security Checklist
+
+- [ ] Input validation on all API endpoints
+- [ ] Rate limiting implemented
+- [ ] CORS properly configured
+- [ ] Environment variables secured
+- [ ] SQL injection prevention (parameterized queries)
+- [ ] XSS protection
+- [ ] CSRF tokens for state-changing operations
+- [ ] Wallet address validation
+- [ ] Smart contract access control
+- [ ] Circle API key rotation policy
+- [ ] HTTPS enforced in production
+- [ ] Database connection encryption
+- [ ] Redis password protection
+
+## Final Integration Testing Script
+
+```typescript
+// tests/final-integration.ts
+
+async function runFinalTests() {
+  console.log('🧪 Running final integration tests...\n');
+  
+  // Test 1: User Registration
+  console.log('Test 1: User Registration');
+  const user = await registerUser();
+  console.log('✅ User registered:', user.walletAddress);
+  
+  // Test 2: Create Position
+  console.log('\nTest 2: Create Position');
+  const position = await createPosition(user.userId, {
+    protocolAddress: '0xTestProtocol',
+    protocolName: 'Test Protocol',
+    amount: 1000,
+  });
+  console.log('✅ Position created:', position.id);
+  
+  // Test 3: ML Prediction
+  console.log('\nTest 3: ML Health Prediction');
+  const prediction = await mlService.predictHealth('0xTestProtocol');
+  console.log('✅ Health Score:', prediction.healthScore);
+  
+  // Test 4: Rebalancing
+  console.log('\nTest 4: Execute Rebalancing');
+  const rebalancing = await executeRebalancing({
+    userId: user.userId,
+    protocolAddress: '0xTestProtocol',
+    exitPercentage: 30,
+  });
+  console.log('✅ Rebalancing executed:', rebalancing.txHash);
+  
+  // Test 5: WebSocket Connection
+  console.log('\nTest 5: WebSocket Connection');
+  wsClient.connect(user.userId);
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  console.log('✅ WebSocket connected');
+  
+  console.log('\n✨ All tests passed!');
+}
+
+runFinalTests();
+```
+
+## Day 4 Implementation Timeline
+
+**Morning (API Development)**:
+
+- [ ] 9:00-10:00: Implement user registration endpoint
+- [ ] 10:00-11:00: Implement positions endpoints (GET, POST)
+- [ ] 11:00-12:00: Implement protocol health endpoints
+- [ ] 12:00-1:00: Implement rebalancing endpoints
+
+**Afternoon (Integration & Automation)**:
+
+- [ ] 2:00-3:00: Integrate Circle SDK and wallet service
+- [ ] 3:00-4:00: Integrate ML service client
+- [ ] 4:00-5:00: Build automation engine and monitoring loop
+- [ ] 5:00-6:00: Set up WebSocket server and test all connections
+
+## Day 5 Implementation Timeline
+
+**Morning (Frontend API Integration)**:
+
+- [ ] 9:00-10:00: Set up API client and React Query
+- [ ] 10:00-11:00: Connect Dashboard to API
+- [ ] 11:00-12:00: Connect Protocol Health page to API
+- [ ] 12:00-1:00: Test real-time data flow
+
+**Afternoon (WebSocket & Polish)**:
